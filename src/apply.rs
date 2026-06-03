@@ -49,11 +49,16 @@ impl ChangeApplier {
     pub fn apply_events(&mut self, events: &[SyncEvent]) -> Result<Vec<ConflictInfo>> {
         let mut conflicts = Vec::new();
         for event in events {
-            if let Some(conflict) = self.apply_single(event)? {
+            if let Some(conflict) = self.apply_event(event)? {
                 conflicts.push(conflict);
             }
         }
         Ok(conflicts)
+    }
+
+    /// Apply a single event to the local directory.
+    pub fn apply_event(&mut self, event: &SyncEvent) -> Result<Option<ConflictInfo>> {
+        self.apply_single(event)
     }
 
     /// Check if applying a remote file event would conflict with local changes.
@@ -166,8 +171,6 @@ impl ChangeApplier {
             .with_context(|| format!("Failed to seek temp file: {}", pending.temp_path.display()))?;
         file.write_all(data)
             .with_context(|| format!("Failed to write temp content: {}", pending.temp_path.display()))?;
-        file.flush()
-            .with_context(|| format!("Failed to flush temp content: {}", pending.temp_path.display()))?;
 
         self.try_commit_transfer(path)
     }

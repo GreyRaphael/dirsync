@@ -2,8 +2,12 @@ use crate::event::SyncEvent;
 use std::path::Path;
 use tracing::debug;
 
-/// Default chunk size for file content transfer (64KB).
-pub const DEFAULT_CHUNK_SIZE: usize = 64 * 1024;
+/// Default chunk size for file content transfer.
+///
+/// Larger chunks substantially reduce per-event serialization, locking, and
+/// file-open overhead for large files while still leaving ample room in the
+/// default 64MB shared-memory ring buffer.
+pub const DEFAULT_CHUNK_SIZE: usize = 1024 * 1024;
 
 /// Produce a sequence of `SyncEvent::FileContent` events from pre-read file data.
 ///

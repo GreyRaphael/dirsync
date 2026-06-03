@@ -21,6 +21,8 @@ const PEER_TIMEOUT: Duration = Duration::from_secs(15);
 /// How long to wait for a file's size to stabilize before reading it.
 const STABILITY_INTERVAL: Duration = Duration::from_millis(200);
 const STABILITY_MAX_WAIT: Duration = Duration::from_secs(30);
+const REMOTE_POLL_INTERVAL: Duration = Duration::from_millis(50);
+const MIN_CHUNK_SIZE: usize = 16 * 1024;
 
 /// The sync engine ties together the watcher, shared memory transport, and change applier.
 pub struct SyncEngine {
@@ -55,6 +57,9 @@ impl SyncEngine {
         let mut shm = ShmTransport::create_or_open(&cli.shm_name, cli.shm_size)?;
         shm.register_instance(instance_id)?;
 
+        let chunk_size =
+            (shm.capacity() as usize / 4).clamp(MIN_CHUNK_SIZE, chunker::DEFAULT_CHUNK_SIZE);
+
         let debounce = Duration::from_millis(cli.debounce_ms);
         let watcher = FsWatcher::new(&root, debounce, &cli.ignore)?;
 
@@ -69,7 +74,7 @@ impl SyncEngine {
             watcher,
             applier,
             seq: 0,
-            chunk_size: chunker::DEFAULT_CHUNK_SIZE,
+            chunk_size,
             ignore_dirs: cli.ignore.clone(),
             running,
             last_remote_heartbeat: now,
@@ -179,9 +184,15 @@ impl SyncEngine {
         self.push_and_maybe_drain(corrected_event.clone(), drain_remote)?;
         self.watcher.record_applied_event(&corrected_event);
 
-        let chunks = chunker::chunk_data(&rel_path, &data, self.chunk_size);
-        for chunk in chunks {
-            self.push_and_maybe_drain(chunk, drain_remote)?;
+        for (index, chunk) in data.chunks(self.chunk_size).enumerate() {
+            self.push_and_maybe_drain(
+                SyncEvent::FileContent {
+                    path: rel_path.clone(),
+                    offset: (index * self.chunk_size) as u64,
+                    data: chunk.to_vec(),
+                },
+                drain_remote,
+            )?;
         }
 
         Ok(())
@@ -253,58 +264,45 @@ impl SyncEngine {
     }
 
     fn handle_remote_events(&mut self, remote_envelopes: &[EventEnvelope]) -> Result<()> {
+        let mut applied = 0usize;
+
         for envelope in remote_envelopes {
-            if envelope.instance_id != self.instance_id
-                && matches!(envelope.event, SyncEvent::Heartbeat { .. })
-            {
+            if envelope.instance_id == self.instance_id {
+                continue;
+            }
+
+            if matches!(envelope.event, SyncEvent::Heartbeat { .. }) {
                 self.last_remote_heartbeat = Instant::now();
                 debug!("Heartbeat received from instance {}", envelope.instance_id);
+                continue;
             }
-        }
 
-        let remote_events: Vec<SyncEvent> = remote_envelopes
-            .iter()
-            .filter(|e| e.instance_id != self.instance_id)
-            .filter(|e| !matches!(e.event, SyncEvent::Heartbeat { .. }))
-            .map(|e| e.event.clone())
-            .collect();
-
-        if remote_events.is_empty() {
-            return Ok(());
-        }
-
-        debug!("Applying {} remote events", remote_events.len());
-
-        // Record which paths the applier will write, so the watcher can
-        // suppress them on the next iteration (echo prevention).
-        for event in &remote_events {
-            if let Some(p) = event.path() {
-                self.suppressed_paths.insert(p.clone());
+            if let Some(path) = envelope.event.path() {
+                self.suppressed_paths.insert(path.clone());
             }
-        }
 
-        match self.applier.apply_events(&remote_events) {
-            Ok(conflicts) => {
-                let conflict_paths: HashSet<PathBuf> =
-                    conflicts.iter().map(|c| c.path.clone()).collect();
-                for c in &conflicts {
+            match self.applier.apply_event(&envelope.event) {
+                Ok(Some(conflict)) => {
                     info!(
                         "Conflict detected: {} (local={}B, remote={}B)",
-                        c.path.display(),
-                        c.local_size,
-                        c.remote_size
+                        conflict.path.display(),
+                        conflict.local_size,
+                        conflict.remote_size
                     );
                 }
-                for event in &remote_events {
-                    match event.path() {
-                        Some(path) if conflict_paths.contains(path) => {}
-                        _ => self.watcher.record_applied_event(event),
-                    }
+                Ok(None) => {
+                    self.watcher.record_applied_event(&envelope.event);
+                }
+                Err(e) => {
+                    warn!("Failed to apply remote event: {}", e);
                 }
             }
-            Err(e) => {
-                warn!("Failed to apply remote events: {}", e);
-            }
+
+            applied += 1;
+        }
+
+        if applied > 0 {
+            debug!("Applied {} remote events", applied);
         }
 
         Ok(())
@@ -325,9 +323,16 @@ impl SyncEngine {
             // 1. Send heartbeat if needed
             self.maybe_send_heartbeat()?;
 
-            // 2. Collect local filesystem events, suppressing paths that were
+            // 2. Drain remote events before waiting on local filesystem input.
+            // Large transfers can fill the ring buffer quickly; keeping the
+            // receiver cursor moving is more important than watcher latency.
+            self.drain_remote_events()?;
+
+            // 3. Collect local filesystem events, suppressing paths that were
             //    written by the applier in the previous iteration (echo prevention).
-            let raw_events = self.watcher.collect_events_timeout(&self.root, Duration::from_millis(500));
+            let raw_events = self
+                .watcher
+                .collect_events_timeout(&self.root, REMOTE_POLL_INTERVAL);
             let local_events: Vec<SyncEvent> = raw_events
                 .into_iter()
                 .filter(|e| {
@@ -352,10 +357,10 @@ impl SyncEngine {
                 }
             }
 
-            // 3. Pop remote events from SHM
+            // 4. Pop remote events from SHM
             self.drain_remote_events()?;
 
-            // 4. Check peer liveness
+            // 5. Check peer liveness
             self.check_peer_alive();
         }
 
