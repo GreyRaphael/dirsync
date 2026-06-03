@@ -2,8 +2,8 @@ use anyhow::Result;
 use clap::Parser;
 use dirsync::cli::Cli;
 use dirsync::sync::SyncEngine;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 

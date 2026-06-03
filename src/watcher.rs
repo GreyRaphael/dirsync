@@ -2,8 +2,8 @@ use crate::event::SyncEvent;
 use anyhow::{Context, Result};
 use blake3::Hasher;
 use notify::{
-    event::{ModifyKind, RemoveKind, RenameMode},
     Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher,
+    event::{ModifyKind, RemoveKind, RenameMode},
 };
 use std::collections::HashMap;
 use std::fs;
@@ -97,14 +97,11 @@ impl FsWatcher {
     /// Call this after `initial_sync` so that subsequent events are
     /// correctly classified as create vs modify.
     pub fn seed_tracker(&mut self, root: &Path, ignore_dirs: &[String]) {
-        for entry in WalkDir::new(root)
-            .into_iter()
-            .filter_entry(|e| {
-                let name = e.file_name().to_string_lossy();
-                name.as_ref() != INTERNAL_TEMP_DIR
-                    && !ignore_dirs.iter().any(|d| name.as_ref() == d.as_str())
-            })
-        {
+        for entry in WalkDir::new(root).into_iter().filter_entry(|e| {
+            let name = e.file_name().to_string_lossy();
+            name.as_ref() != INTERNAL_TEMP_DIR
+                && !ignore_dirs.iter().any(|d| name.as_ref() == d.as_str())
+        }) {
             let entry = match entry {
                 Ok(e) => e,
                 Err(_) => continue,
@@ -117,7 +114,10 @@ impl FsWatcher {
                 self.tracker.record(rel.to_path_buf(), hash, size);
             }
         }
-        info!("Seeded file tracker with {} entries", self.tracker.states.len());
+        info!(
+            "Seeded file tracker with {} entries",
+            self.tracker.states.len()
+        );
     }
 
     /// Start watching the given directory.
@@ -164,7 +164,10 @@ impl FsWatcher {
             }
         }
 
-        by_path.into_values().filter(|e| self.should_emit(e)).collect()
+        by_path
+            .into_values()
+            .filter(|e| self.should_emit(e))
+            .collect()
     }
 
     /// Block until at least one event arrives, then collect with debounce.
@@ -206,7 +209,10 @@ impl FsWatcher {
         }
 
         // Filter out events where the file hasn't actually changed
-        by_path.into_values().filter(|e| self.should_emit(e)).collect()
+        by_path
+            .into_values()
+            .filter(|e| self.should_emit(e))
+            .collect()
     }
 
     /// Record a successfully applied remote event in the local tracker.
@@ -271,9 +277,7 @@ impl FsWatcher {
             SyncEvent::DirCreated { .. } => true,
             SyncEvent::DirDeleted { path } => {
                 // Remove all tracked files under this directory
-                self.tracker
-                    .states
-                    .retain(|p, _| !p.starts_with(path));
+                self.tracker.states.retain(|p, _| !p.starts_with(path));
                 true
             }
             SyncEvent::FileContent { .. } | SyncEvent::Heartbeat { .. } => true,
@@ -321,7 +325,12 @@ impl FsWatcher {
         }
     }
 
-    fn remove_event(&self, root: &Path, path: &Path, kind: Option<&RemoveKind>) -> Option<SyncEvent> {
+    fn remove_event(
+        &self,
+        root: &Path,
+        path: &Path,
+        kind: Option<&RemoveKind>,
+    ) -> Option<SyncEvent> {
         let rel = path.strip_prefix(root).ok()?.to_path_buf();
         let is_file = match kind {
             Some(RemoveKind::File) => true,
@@ -417,8 +426,12 @@ impl FsWatcher {
     }
 
     fn is_ignored(&self, path: &Path) -> bool {
-        self.ignore_dirs.iter().any(|ignore| path.starts_with(ignore))
-            || path.components().any(|c| c.as_os_str() == INTERNAL_TEMP_DIR)
+        self.ignore_dirs
+            .iter()
+            .any(|ignore| path.starts_with(ignore))
+            || path
+                .components()
+                .any(|c| c.as_os_str() == INTERNAL_TEMP_DIR)
     }
 }
 
@@ -469,8 +482,8 @@ fn read_with_retry(path: &Path, max_retries: u32, delay: Duration) -> Result<Vec
 ///
 /// Returns the file size once stable, or an error if it never stabilizes.
 pub fn wait_for_stable(path: &Path, interval: Duration, max_wait: Duration) -> Result<u64> {
-    let initial = fs::metadata(path)
-        .with_context(|| format!("Failed to stat {}", path.display()))?;
+    let initial =
+        fs::metadata(path).with_context(|| format!("Failed to stat {}", path.display()))?;
     let mut prev_size = initial.len();
     let mut prev_modified = initial.modified().ok();
     let mut quiet_for = Duration::ZERO;
@@ -527,8 +540,7 @@ pub fn wait_for_stable(path: &Path, interval: Duration, max_wait: Duration) -> R
 /// This is the single-read entry point: the caller gets the raw bytes,
 /// the blake3 hash, and the size — all from one read, no TOCTOU.
 pub fn read_and_hash(path: &Path) -> Result<(Vec<u8>, [u8; 32], u64)> {
-    let data = fs::read(path)
-        .with_context(|| format!("Failed to read {}", path.display()))?;
+    let data = fs::read(path).with_context(|| format!("Failed to read {}", path.display()))?;
     let (hash, size) = hash_data(&data);
     Ok((data, hash, size))
 }
@@ -537,14 +549,11 @@ pub fn read_and_hash(path: &Path) -> Result<(Vec<u8>, [u8; 32], u64)> {
 pub fn initial_scan(root: &Path, ignore_dirs: &[String]) -> Vec<SyncEvent> {
     let mut events = Vec::new();
 
-    for entry in WalkDir::new(root)
-        .into_iter()
-        .filter_entry(|e| {
-            let name = e.file_name().to_string_lossy();
-            name.as_ref() != INTERNAL_TEMP_DIR
-                && !ignore_dirs.iter().any(|d| name.as_ref() == d.as_str())
-        })
-    {
+    for entry in WalkDir::new(root).into_iter().filter_entry(|e| {
+        let name = e.file_name().to_string_lossy();
+        name.as_ref() != INTERNAL_TEMP_DIR
+            && !ignore_dirs.iter().any(|d| name.as_ref() == d.as_str())
+    }) {
         match entry {
             Ok(entry) => {
                 let path = entry.path();
@@ -685,9 +694,9 @@ mod tests {
         let events = initial_scan(dir.path(), &[]);
         assert!(events.len() >= 2);
 
-        let has_dir = events.iter().any(|e| {
-            matches!(e, SyncEvent::DirCreated { path } if path == Path::new("sub"))
-        });
+        let has_dir = events
+            .iter()
+            .any(|e| matches!(e, SyncEvent::DirCreated { path } if path == Path::new("sub")));
         let has_file = events.iter().any(|e| {
             matches!(e, SyncEvent::FileCreated { path, .. } if path == Path::new("sub/file.txt"))
         });

@@ -42,7 +42,7 @@ pub struct RunArgs {
     #[arg(short, long, action = clap::ArgAction::Count)]
     pub verbose: u8,
 
-    /// Conflict resolution strategy
+    /// Conflict handling mode (conflicts are currently reported and local copies are preserved)
     #[arg(long, value_enum, default_value_t = ConflictStrategy::LastWriteWins)]
     pub conflict: ConflictStrategy,
 
@@ -126,8 +126,8 @@ impl Cli {
 
 #[derive(clap::ValueEnum, Clone, Debug, PartialEq)]
 pub enum ConflictStrategy {
-    /// Last write wins (by timestamp)
+    /// Reserved for last-write-wins conflict resolution.
     LastWriteWins,
-    /// Keep both copies (file.txt.a / file.txt.b)
+    /// Reserved for keep-both conflict resolution.
     KeepBoth,
 }

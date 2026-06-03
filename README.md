@@ -1,14 +1,14 @@
 # dirsync
 
-Directory synchronization over shared memory — a CLI tool that keeps two directories in sync using zero-copy shared memory IPC.
+Directory synchronization over shared memory — a CLI tool that keeps two directories in sync using shared-memory IPC.
 
 ## Features
 
-- **Shared memory transport** — events exchanged via lock-free ring buffer, no network overhead
+- **Shared memory transport** — events exchanged via a shared-memory ring buffer, no network overhead
 - **Real-time monitoring** — uses OS-native file watchers (inotify / FSEvents / ReadDirectoryChangesW)
 - **Incremental sync** — only transfers changed files, with blake3 content hashing
-- **Large file support** — automatic chunked transfer for files of any size
-- **Conflict detection** — detects simultaneous modifications and reports conflicts
+- **Large file support** — automatic chunked transfer for large files
+- **Conflict detection** — detects simultaneous modifications and reports conflicts while preserving the local copy
 - **Event debouncing** — merges rapid filesystem events within a configurable window
 - **Heartbeat** — monitors peer liveness with periodic heartbeat events
 - **Graceful shutdown** — handles Ctrl+C cleanly, no leaked shared memory segments
@@ -53,7 +53,7 @@ Command options:
       --shm-name <SHM_NAME>        Shared memory segment name [default: dirsync_shm]
       --shm-size <SHM_SIZE>        Shared memory size in bytes [default: 67108864]
   -v, --verbose...                 Verbose output (-v, -vv, -vvv)
-      --conflict <CONFLICT>        Conflict strategy: last-write-wins | keep-both [default: last-write-wins]
+      --conflict <CONFLICT>        Conflict mode: last-write-wins | keep-both [default: last-write-wins]
       --debounce-ms <DEBOUNCE_MS>  Debounce interval in ms [default: 100]
       --ignore <IGNORE>            Directories to ignore (repeatable)
   -h, --help                       Print help
@@ -74,10 +74,12 @@ dirsync join -i ./docs-b --shm-name docs_sync
 dirsync host -i ./src-a --ignore node_modules --ignore .git
 dirsync join -i ./src-b --ignore node_modules --ignore .git
 
-# Keep both copies on conflict
+# Choose a conflict mode
 dirsync host -i ./work-a --conflict keep-both
 dirsync join -i ./work-b --conflict keep-both
 ```
+
+> Note: the current release detects conflicts and preserves the local copy. Full automatic `last-write-wins` / `keep-both` resolution is reserved for a follow-up.
 
 ## Architecture
 

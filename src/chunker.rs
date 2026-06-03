@@ -13,11 +13,7 @@ pub const DEFAULT_CHUNK_SIZE: usize = 1024 * 1024;
 ///
 /// This is the preferred entry point — the caller reads the file once and passes
 /// the data here, eliminating the TOCTOU between hashing and chunking.
-pub fn chunk_data(
-    relative_path: &Path,
-    data: &[u8],
-    chunk_size: usize,
-) -> Vec<SyncEvent> {
+pub fn chunk_data(relative_path: &Path, data: &[u8], chunk_size: usize) -> Vec<SyncEvent> {
     let total_size = data.len();
     let mut events = Vec::new();
     let mut offset: u64 = 0;

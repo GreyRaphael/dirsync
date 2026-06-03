@@ -75,9 +75,16 @@ fn test_bidirectional_sync() {
     let shm = ShmTransport::create(&name, 65536).unwrap();
 
     // Instance 0 writes
-    shm.push_event(0, &seq_envelope(0, 1, SyncEvent::DirCreated {
-        path: PathBuf::from("docs"),
-    }))
+    shm.push_event(
+        0,
+        &seq_envelope(
+            0,
+            1,
+            SyncEvent::DirCreated {
+                path: PathBuf::from("docs"),
+            },
+        ),
+    )
     .unwrap();
 
     // Instance 1 writes
@@ -385,7 +392,12 @@ fn test_conflict_last_write_wins_remote_overwrites() {
     // Conflict should be detected
     assert_eq!(conflicts.len(), 1);
     assert_eq!(conflicts[0].path, PathBuf::from("shared.txt"));
-    assert_eq!(conflicts[0].local_hash, file_hash_and_size(&dir.path().join("shared.txt")).unwrap().0);
+    assert_eq!(
+        conflicts[0].local_hash,
+        file_hash_and_size(&dir.path().join("shared.txt"))
+            .unwrap()
+            .0
+    );
     assert_eq!(conflicts[0].remote_hash, hash_b);
 }
 

@@ -23,17 +23,11 @@ pub enum SyncEvent {
         size: u64,
     },
     /// A file was deleted
-    FileDeleted {
-        path: PathBuf,
-    },
+    FileDeleted { path: PathBuf },
     /// A new directory was created
-    DirCreated {
-        path: PathBuf,
-    },
+    DirCreated { path: PathBuf },
     /// A directory was deleted
-    DirDeleted {
-        path: PathBuf,
-    },
+    DirDeleted { path: PathBuf },
     /// Chunk of file content for large file transfer
     FileContent {
         path: PathBuf,
@@ -41,9 +35,7 @@ pub enum SyncEvent {
         data: Vec<u8>,
     },
     /// Heartbeat to detect process liveness
-    Heartbeat {
-        timestamp: i64,
-    },
+    Heartbeat { timestamp: i64 },
 }
 
 impl SyncEvent {
@@ -184,7 +176,9 @@ mod tests {
             instance_id: 1,
             seq: 42,
             timestamp: 1700000000000,
-            event: SyncEvent::Heartbeat { timestamp: 1700000000000 },
+            event: SyncEvent::Heartbeat {
+                timestamp: 1700000000000,
+            },
         };
         let encoded = bincode::serialize(&envelope).unwrap();
         let decoded: EventEnvelope = bincode::deserialize(&encoded).unwrap();

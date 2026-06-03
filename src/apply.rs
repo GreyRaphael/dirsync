@@ -1,10 +1,11 @@
 use crate::cli::ConflictStrategy;
 use crate::event::SyncEvent;
-use crate::watcher::{file_hash_and_size, INTERNAL_TEMP_DIR};
+use crate::watcher::{INTERNAL_TEMP_DIR, file_hash_and_size};
 use anyhow::{Context, Result};
 use std::collections::{HashMap, HashSet};
+use std::ffi::OsStr;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use tracing::{debug, info, warn};
 
 /// Cached state for conflict detection: path → (hash, size).
@@ -19,6 +20,7 @@ struct PendingFileTransfer {
 /// Apply received SyncEvents to the local directory.
 pub struct ChangeApplier {
     root: PathBuf,
+    root_canonical: PathBuf,
     #[allow(dead_code)]
     conflict_strategy: ConflictStrategy,
     /// The hash of the file as last confirmed synced and committed to the final path.
@@ -34,13 +36,104 @@ pub struct ChangeApplier {
 
 impl ChangeApplier {
     pub fn new(root: &Path, conflict_strategy: ConflictStrategy) -> Self {
+        let root_canonical = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
         Self {
             root: root.to_path_buf(),
+            root_canonical,
             conflict_strategy,
             last_synced_hash: HashMap::new(),
             pending_remote_files: HashMap::new(),
             blocked_remote_files: HashSet::new(),
         }
+    }
+
+    fn validate_event_path(path: &Path) -> Result<()> {
+        if path.as_os_str().is_empty() {
+            anyhow::bail!("Remote event path must not be empty");
+        }
+
+        for component in path.components() {
+            match component {
+                Component::Normal(name) if name != OsStr::new(INTERNAL_TEMP_DIR) => {}
+                Component::Normal(_) => {
+                    anyhow::bail!(
+                        "Remote event path must not target internal directory: {}",
+                        path.display()
+                    );
+                }
+                Component::Prefix(_)
+                | Component::RootDir
+                | Component::CurDir
+                | Component::ParentDir => {
+                    anyhow::bail!("Unsafe remote event path: {}", path.display());
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn deepest_existing_ancestor(path: &Path) -> Option<PathBuf> {
+        let mut current = Some(path);
+        while let Some(candidate) = current {
+            if candidate.exists() {
+                return Some(candidate.to_path_buf());
+            }
+            current = candidate.parent();
+        }
+        None
+    }
+
+    fn ensure_existing_ancestor_within(base_canonical: &Path, target: &Path) -> Result<()> {
+        let ancestor = Self::deepest_existing_ancestor(target)
+            .ok_or_else(|| anyhow::anyhow!("No existing ancestor for {}", target.display()))?;
+        let ancestor_canonical = ancestor
+            .canonicalize()
+            .with_context(|| format!("Failed to canonicalize {}", ancestor.display()))?;
+
+        if !ancestor_canonical.starts_with(base_canonical) {
+            anyhow::bail!("Remote event path escapes sync root: {}", target.display());
+        }
+
+        Ok(())
+    }
+
+    fn safe_target_path(&self, path: &Path) -> Result<PathBuf> {
+        Self::validate_event_path(path)?;
+        let target = self.root.join(path);
+        Self::ensure_existing_ancestor_within(&self.root_canonical, &target)?;
+        Ok(target)
+    }
+
+    fn temp_path_for(&self, path: &Path) -> Result<PathBuf> {
+        Self::validate_event_path(path)?;
+        let temp_root = self.root.join(INTERNAL_TEMP_DIR);
+
+        if let Ok(metadata) = fs::symlink_metadata(&temp_root)
+            && metadata.file_type().is_symlink()
+        {
+            anyhow::bail!(
+                "Internal temp directory is a symlink: {}",
+                temp_root.display()
+            );
+        }
+
+        fs::create_dir_all(&temp_root)
+            .with_context(|| format!("Failed to create temp root: {}", temp_root.display()))?;
+
+        let temp_root_canonical = temp_root.canonicalize().with_context(|| {
+            format!("Failed to canonicalize temp root: {}", temp_root.display())
+        })?;
+        if !temp_root_canonical.starts_with(&self.root_canonical) {
+            anyhow::bail!(
+                "Internal temp directory escapes sync root: {}",
+                temp_root.display()
+            );
+        }
+
+        let target = temp_root.join(path);
+        Self::ensure_existing_ancestor_within(&temp_root_canonical, &target)?;
+        Ok(target)
     }
 
     /// Apply a batch of events to the local directory.
@@ -64,8 +157,16 @@ impl ChangeApplier {
     /// Check if applying a remote file event would conflict with local changes.
     ///
     /// Returns Some(conflict info) if there's a conflict, None otherwise.
-    fn detect_conflict(&self, path: &Path, remote_hash: &[u8; 32], remote_size: u64) -> Option<ConflictInfo> {
-        let full_path = self.root.join(path);
+    fn detect_conflict(
+        &self,
+        path: &Path,
+        remote_hash: &[u8; 32],
+        remote_size: u64,
+    ) -> Option<ConflictInfo> {
+        let full_path = match self.safe_target_path(path) {
+            Ok(path) => path,
+            Err(_) => return None,
+        };
         if !full_path.exists() {
             return None; // No local file, no conflict
         }
@@ -102,10 +203,6 @@ impl ChangeApplier {
         None
     }
 
-    fn temp_path_for(&self, path: &Path) -> PathBuf {
-        self.root.join(INTERNAL_TEMP_DIR).join(path)
-    }
-
     fn prepare_transfer(
         &mut self,
         path: &Path,
@@ -115,7 +212,7 @@ impl ChangeApplier {
         self.blocked_remote_files.remove(path);
         self.pending_remote_files.remove(path);
 
-        let full_path = self.root.join(path);
+        let full_path = self.safe_target_path(path)?;
         if let Some(parent) = full_path.parent() {
             fs::create_dir_all(parent)
                 .with_context(|| format!("Failed to create parent dir: {}", parent.display()))?;
@@ -127,7 +224,10 @@ impl ChangeApplier {
             let (actual_hash, actual_size) = file_hash_and_size(&full_path)
                 .with_context(|| format!("Failed to hash empty file: {}", full_path.display()))?;
             if actual_hash != expected_hash {
-                warn!("Committed empty file with mismatched metadata hash: {}", path.display());
+                warn!(
+                    "Committed empty file with mismatched metadata hash: {}",
+                    path.display()
+                );
             }
             self.last_synced_hash
                 .insert(path.to_path_buf(), (actual_hash, actual_size));
@@ -135,10 +235,11 @@ impl ChangeApplier {
             return Ok(());
         }
 
-        let temp_path = self.temp_path_for(path);
+        let temp_path = self.temp_path_for(path)?;
         if let Some(parent) = temp_path.parent() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("Failed to create temp parent dir: {}", parent.display()))?;
+            fs::create_dir_all(parent).with_context(|| {
+                format!("Failed to create temp parent dir: {}", parent.display())
+            })?;
         }
         fs::File::create(&temp_path)
             .with_context(|| format!("Failed to create temp file: {}", temp_path.display()))?;
@@ -166,11 +267,18 @@ impl ChangeApplier {
             .write(true)
             .truncate(false)
             .open(&pending.temp_path)
-            .with_context(|| format!("Failed to open temp file: {}", pending.temp_path.display()))?;
-        file.seek(SeekFrom::Start(offset))
-            .with_context(|| format!("Failed to seek temp file: {}", pending.temp_path.display()))?;
-        file.write_all(data)
-            .with_context(|| format!("Failed to write temp content: {}", pending.temp_path.display()))?;
+            .with_context(|| {
+                format!("Failed to open temp file: {}", pending.temp_path.display())
+            })?;
+        file.seek(SeekFrom::Start(offset)).with_context(|| {
+            format!("Failed to seek temp file: {}", pending.temp_path.display())
+        })?;
+        file.write_all(data).with_context(|| {
+            format!(
+                "Failed to write temp content: {}",
+                pending.temp_path.display()
+            )
+        })?;
 
         self.try_commit_transfer(path)
     }
@@ -210,14 +318,15 @@ impl ChangeApplier {
             return Ok(());
         }
 
-        let full_path = self.root.join(path);
+        let full_path = self.safe_target_path(path)?;
         if let Some(parent) = full_path.parent() {
             fs::create_dir_all(parent)
                 .with_context(|| format!("Failed to create parent dir: {}", parent.display()))?;
         }
         if full_path.exists() {
-            fs::remove_file(&full_path)
-                .with_context(|| format!("Failed to replace existing file: {}", full_path.display()))?;
+            fs::remove_file(&full_path).with_context(|| {
+                format!("Failed to replace existing file: {}", full_path.display())
+            })?;
         }
         fs::rename(&temp_path, &full_path).with_context(|| {
             format!(
@@ -230,12 +339,16 @@ impl ChangeApplier {
         self.pending_remote_files.remove(path);
         self.last_synced_hash
             .insert(path.to_path_buf(), (expected_hash, expected_size));
-        info!("Committed file: {} ({} bytes)", path.display(), expected_size);
+        info!(
+            "Committed file: {} ({} bytes)",
+            path.display(),
+            expected_size
+        );
         Ok(())
     }
 
     fn write_direct_chunk(&mut self, path: &Path, offset: u64, data: &[u8]) -> Result<()> {
-        let full_path = self.root.join(path);
+        let full_path = self.safe_target_path(path)?;
         use std::io::{Seek, SeekFrom, Write};
         if let Some(parent) = full_path.parent() {
             fs::create_dir_all(parent)
@@ -257,7 +370,8 @@ impl ChangeApplier {
             .with_context(|| format!("Failed to write content: {}", full_path.display()))?;
 
         if let Ok((hash, size)) = file_hash_and_size(&full_path) {
-            self.last_synced_hash.insert(path.to_path_buf(), (hash, size));
+            self.last_synced_hash
+                .insert(path.to_path_buf(), (hash, size));
         }
         Ok(())
     }
@@ -298,15 +412,16 @@ impl ChangeApplier {
             }
 
             SyncEvent::FileDeleted { path } => {
-                let full_path = self.root.join(path);
+                let full_path = self.safe_target_path(path)?;
                 self.pending_remote_files.remove(path);
                 self.blocked_remote_files.remove(path);
-                let temp_path = self.temp_path_for(path);
+                let temp_path = self.temp_path_for(path)?;
                 let _ = fs::remove_file(temp_path);
                 self.last_synced_hash.remove(path);
                 if full_path.exists() {
-                    fs::remove_file(&full_path)
-                        .with_context(|| format!("Failed to delete file: {}", full_path.display()))?;
+                    fs::remove_file(&full_path).with_context(|| {
+                        format!("Failed to delete file: {}", full_path.display())
+                    })?;
                     info!("Deleted file: {}", path.display());
                 } else {
                     debug!("File already gone: {}", path.display());
@@ -315,25 +430,28 @@ impl ChangeApplier {
             }
 
             SyncEvent::DirCreated { path } => {
-                let full_path = self.root.join(path);
+                let full_path = self.safe_target_path(path)?;
                 if !full_path.exists() {
-                    fs::create_dir_all(&full_path)
-                        .with_context(|| format!("Failed to create dir: {}", full_path.display()))?;
+                    fs::create_dir_all(&full_path).with_context(|| {
+                        format!("Failed to create dir: {}", full_path.display())
+                    })?;
                     info!("Created directory: {}", path.display());
                 }
                 Ok(None)
             }
 
             SyncEvent::DirDeleted { path } => {
-                let full_path = self.root.join(path);
+                let full_path = self.safe_target_path(path)?;
                 self.last_synced_hash.retain(|p, _| !p.starts_with(path));
-                self.pending_remote_files.retain(|p, _| !p.starts_with(path));
+                self.pending_remote_files
+                    .retain(|p, _| !p.starts_with(path));
                 self.blocked_remote_files.retain(|p| !p.starts_with(path));
-                let temp_path = self.temp_path_for(path);
+                let temp_path = self.temp_path_for(path)?;
                 let _ = fs::remove_dir_all(temp_path);
                 if full_path.exists() {
-                    fs::remove_dir_all(&full_path)
-                        .with_context(|| format!("Failed to delete dir: {}", full_path.display()))?;
+                    fs::remove_dir_all(&full_path).with_context(|| {
+                        format!("Failed to delete dir: {}", full_path.display())
+                    })?;
                     info!("Deleted directory: {}", path.display());
                 }
                 Ok(None)
@@ -346,7 +464,12 @@ impl ChangeApplier {
                 }
 
                 self.write_pending_chunk(path, *offset, data)?;
-                debug!("Received {} bytes at offset {} for {}", data.len(), offset, path.display());
+                debug!(
+                    "Received {} bytes at offset {} for {}",
+                    data.len(),
+                    offset,
+                    path.display()
+                );
                 Ok(None)
             }
 
@@ -428,7 +551,10 @@ mod tests {
         // No conflict on first sync, and existing content is preserved until
         // the remote content chunks are complete and verified.
         assert!(conflicts.is_empty());
-        assert_eq!(fs::read(dir.path().join("existing.txt")).unwrap(), b"original");
+        assert_eq!(
+            fs::read(dir.path().join("existing.txt")).unwrap(),
+            b"original"
+        );
     }
 
     #[test]
@@ -479,7 +605,55 @@ mod tests {
             data: b"hello".to_vec(),
         }];
         applier.apply_events(&events).unwrap();
-        assert_eq!(fs::read(dir.path().join("deep/nested/file.txt")).unwrap(), b"hello");
+        assert_eq!(
+            fs::read(dir.path().join("deep/nested/file.txt")).unwrap(),
+            b"hello"
+        );
+    }
+
+    #[test]
+    fn test_rejects_parent_path_escape() {
+        let (dir, mut applier) = setup(ConflictStrategy::LastWriteWins);
+        let outside_name = format!("dirsync_escape_{}_parent.txt", std::process::id());
+        let outside_path = dir.path().parent().unwrap().join(&outside_name);
+        let _ = fs::remove_file(&outside_path);
+
+        let result = applier.apply_events(&[SyncEvent::FileContent {
+            path: PathBuf::from("..").join(&outside_name),
+            offset: 0,
+            data: b"escape".to_vec(),
+        }]);
+
+        assert!(result.is_err());
+        assert!(!outside_path.exists());
+    }
+
+    #[test]
+    fn test_rejects_absolute_event_path() {
+        let (dir, mut applier) = setup(ConflictStrategy::LastWriteWins);
+        let absolute_path = dir.path().join("absolute.txt");
+
+        let result = applier.apply_events(&[SyncEvent::FileContent {
+            path: absolute_path.clone(),
+            offset: 0,
+            data: b"absolute".to_vec(),
+        }]);
+
+        assert!(result.is_err());
+        assert!(!absolute_path.exists());
+    }
+
+    #[test]
+    fn test_rejects_internal_temp_event_path() {
+        let (_dir, mut applier) = setup(ConflictStrategy::LastWriteWins);
+
+        let result = applier.apply_events(&[SyncEvent::FileContent {
+            path: PathBuf::from(INTERNAL_TEMP_DIR).join("payload.txt"),
+            offset: 0,
+            data: b"internal".to_vec(),
+        }]);
+
+        assert!(result.is_err());
     }
 
     #[test]
@@ -554,7 +728,10 @@ mod tests {
         applier.apply_events(&events).unwrap();
         assert!(dir.path().join("docs").is_dir());
         assert!(dir.path().join("docs/readme.md").exists());
-        assert_eq!(fs::read(dir.path().join("docs/readme.md")).unwrap(), b"# Hello");
+        assert_eq!(
+            fs::read(dir.path().join("docs/readme.md")).unwrap(),
+            b"# Hello"
+        );
     }
 
     #[test]
@@ -577,19 +754,20 @@ mod tests {
         // First sync: remote creates a file and delivers content
         let remote_data = b"remote data";
         let (remote_hash, remote_size) = hash_size(remote_data);
-        applier.apply_events(&[
-            SyncEvent::FileCreated {
-                path: PathBuf::from("shared.txt"),
-                content_hash: remote_hash,
-                size: remote_size,
-            },
-            SyncEvent::FileContent {
-                path: PathBuf::from("shared.txt"),
-                offset: 0,
-                data: remote_data.to_vec(),
-            },
-        ])
-        .unwrap();
+        applier
+            .apply_events(&[
+                SyncEvent::FileCreated {
+                    path: PathBuf::from("shared.txt"),
+                    content_hash: remote_hash,
+                    size: remote_size,
+                },
+                SyncEvent::FileContent {
+                    path: PathBuf::from("shared.txt"),
+                    offset: 0,
+                    data: remote_data.to_vec(),
+                },
+            ])
+            .unwrap();
 
         // Verify file now has content (last_synced_hash should be set)
         assert!(dir.path().join("shared.txt").exists());

@@ -1,4 +1,4 @@
-use crate::event::{EventEnvelope, ShmHeader, SHM_HEADER_SIZE};
+use crate::event::{EventEnvelope, SHM_HEADER_SIZE, ShmHeader};
 use anyhow::{Context, Result};
 use shared_memory::{Shmem, ShmemConf};
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -16,6 +16,9 @@ const MAX_SPIN: u32 = 2_000_000;
 const PUSH_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
 const PUSH_RETRY_SLEEP: Duration = Duration::from_millis(10);
 
+/// Smallest segment that can hold the header and a non-empty ring buffer.
+const MIN_SHM_SIZE: usize = SHM_HEADER_SIZE + 8;
+
 /// Ring buffer based shared memory transport for SyncEvents.
 pub struct ShmTransport {
     shmem: Shmem,
@@ -26,8 +29,62 @@ pub struct ShmTransport {
 }
 
 impl ShmTransport {
+    fn validate_total_size(total_size: usize) -> Result<()> {
+        if total_size < MIN_SHM_SIZE {
+            anyhow::bail!(
+                "SHM size too small: {} bytes (minimum {} bytes)",
+                total_size,
+                MIN_SHM_SIZE
+            );
+        }
+
+        let max_size = SHM_HEADER_SIZE + u32::MAX as usize;
+        if total_size > max_size {
+            anyhow::bail!(
+                "SHM size too large: {} bytes (maximum {} bytes)",
+                total_size,
+                max_size
+            );
+        }
+
+        Ok(())
+    }
+
+    fn validate_header_bounds(header: &ShmHeader, total_size: usize) -> Result<()> {
+        Self::validate_total_size(total_size)?;
+
+        let max_capacity = total_size - SHM_HEADER_SIZE;
+        let capacity = header.rb_capacity as usize;
+        if capacity == 0 || capacity > max_capacity {
+            anyhow::bail!(
+                "Invalid ring buffer capacity: {} bytes (segment allows {} bytes)",
+                capacity,
+                max_capacity
+            );
+        }
+
+        for (name, cursor) in [
+            ("rb_write", header.rb_write),
+            ("rb_read_a", header.rb_read_a),
+            ("rb_read_b", header.rb_read_b),
+        ] {
+            if cursor as usize >= capacity {
+                anyhow::bail!(
+                    "Invalid {} cursor: {} (capacity {})",
+                    name,
+                    cursor,
+                    capacity
+                );
+            }
+        }
+
+        Ok(())
+    }
+
     /// Create a new shared memory segment (first instance).
     pub fn create(name: &str, total_size: usize) -> Result<Self> {
+        Self::validate_total_size(total_size)?;
+
         let shmem = ShmemConf::new()
             .size(total_size)
             .flink(name)
@@ -67,8 +124,17 @@ impl ShmTransport {
             total_size,
         };
 
+        if total_size < SHM_HEADER_SIZE {
+            anyhow::bail!(
+                "SHM segment '{}' is too small to contain a header: {} bytes",
+                name,
+                total_size
+            );
+        }
+
         let header = unsafe { shm.read_header() };
         header.validate()?;
+        Self::validate_header_bounds(header, total_size)?;
 
         debug!("Opened SHM '{}' ({} bytes)", name, total_size);
         Ok(shm)
@@ -192,7 +258,10 @@ impl ShmTransport {
         };
 
         let Some(lock) = self.try_acquire_lock(instance_id) else {
-            tracing::warn!("Failed to acquire lock while unregistering instance {}", instance_id);
+            tracing::warn!(
+                "Failed to acquire lock while unregistering instance {}",
+                instance_id
+            );
             return;
         };
 
@@ -258,7 +327,11 @@ impl ShmTransport {
             // sentinel/empty-space disambiguation.
             if frame_len > cap.saturating_sub(4) {
                 Self::release_lock(lock);
-                anyhow::bail!("Event too large ({} bytes) for buffer ({} bytes)", frame_len, cap);
+                anyhow::bail!(
+                    "Event too large ({} bytes) for buffer ({} bytes)",
+                    frame_len,
+                    cap
+                );
             }
 
             let tail_remaining = cap - w;
@@ -339,9 +412,7 @@ impl ShmTransport {
 
             trace!(
                 "Pushed event ({} bytes) at offset {}, next write={}",
-                data_len,
-                actual_write,
-                new_write
+                data_len, actual_write, new_write
             );
             return Ok(());
         }
@@ -392,11 +463,7 @@ impl ShmTransport {
                 }
                 // Re-read length at offset 0
                 unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        rb.add(0),
-                        len_buf.as_mut_ptr(),
-                        4,
-                    );
+                    std::ptr::copy_nonoverlapping(rb.add(0), len_buf.as_mut_ptr(), 4);
                 }
                 let len2 = u32::from_le_bytes(len_buf);
                 if len2 == WRAP_SENTINEL {
@@ -461,7 +528,11 @@ impl ShmTransport {
 
         Self::release_lock(lock);
 
-        debug!("Popped {} events, read cursor now at {}", events.len(), cursor);
+        debug!(
+            "Popped {} events, read cursor now at {}",
+            events.len(),
+            cursor
+        );
         Ok(events)
     }
 
@@ -511,6 +582,24 @@ mod tests {
         let shm = ShmTransport::create(&name, 4096).unwrap();
         let shm2 = ShmTransport::open(&name).unwrap();
         assert_eq!(shm.total_size, shm2.total_size);
+    }
+
+    #[test]
+    fn test_create_rejects_too_small_size() {
+        let name = unique_name("too_small");
+        assert!(ShmTransport::create(&name, SHM_HEADER_SIZE).is_err());
+    }
+
+    #[test]
+    fn test_open_rejects_invalid_capacity() {
+        let name = unique_name("invalid_capacity");
+        let shm = ShmTransport::create(&name, 4096).unwrap();
+        unsafe {
+            let header = &mut *(shm.base_ptr() as *mut ShmHeader);
+            header.rb_capacity = 4096;
+        }
+
+        assert!(ShmTransport::open(&name).is_err());
     }
 
     #[test]
