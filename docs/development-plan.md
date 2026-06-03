@@ -10,7 +10,7 @@
 
 ```mermaid
 graph TB
-    subgraph PA["进程 A (dirsync -i dir1)"]
+    subgraph PA["进程 A (dirsync host -i dir1)"]
         WA[File Watcher - notify] --> CA[Change Detector]
         CA --> SWA[SHM Writer]
         SRA[SHM Reader] --> MA[Apply Changes to dir1]
@@ -21,7 +21,7 @@ graph TB
         SHB[Ring Buffer B] --> SRA2[SHM Reader A]
     end
 
-    subgraph PB["进程 B (dirsync -i dir2)"]
+    subgraph PB["进程 B (dirsync join -i dir2)"]
         WB[File Watcher - notify] --> CB[Change Detector]
         CB --> SWB[SHM Writer]
         SRB2[SHM Reader] --> MB[Apply Changes to dir2]
@@ -143,7 +143,7 @@ gantt
 
 **任务清单:**
 - [ ] 配置 `Cargo.toml` 所有依赖
-- [ ] 实现 CLI 参数解析 (`-i <dir>`, `--shm-name`, `--shm-size`, `--verbose`)
+- [ ] 实现 CLI 参数解析 (`host/join`, `-i <dir>`, `--shm-name`, `--shm-size`, `--verbose`)
 - [ ] 定义 `SyncEvent` 枚举及序列化
 - [ ] 集成 `anyhow` 错误处理
 - [ ] 集成 `tracing` 日志
@@ -253,17 +253,17 @@ gantt
 ```mermaid
 sequenceDiagram
     participant User
-    participant ProcessA as dirsync -i dir1
+    participant ProcessA as dirsync host -i dir1
     participant SHM as Shared Memory
-    participant ProcessB as dirsync -i dir2
+    participant ProcessB as dirsync join -i dir2
 
-    User->>ProcessA: dirsync -i dir1
+    User->>ProcessA: dirsync host -i dir1
     ProcessA->>SHM: 创建/打开共享内存
     ProcessA->>ProcessA: 初始目录扫描
     ProcessA->>SHM: 写入初始快照事件
     ProcessA->>ProcessA: 启动文件监控
 
-    User->>ProcessB: dirsync -i dir2
+    User->>ProcessB: dirsync join -i dir2
     ProcessB->>SHM: 打开已有共享内存
     ProcessB->>ProcessB: 初始目录扫描
     ProcessB->>SHM: 读取 ProcessA 的事件

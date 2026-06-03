@@ -50,20 +50,20 @@ impl SyncEngine {
     /// Create a new sync engine.
     pub fn new(instance_id: u64, cli: &Cli, running: Arc<AtomicBool>) -> Result<Self> {
         let root = cli
-            .input
+            .input()
             .canonicalize()
-            .unwrap_or_else(|_| cli.input.clone());
+            .unwrap_or_else(|_| cli.input().clone());
 
-        let mut shm = ShmTransport::create_or_open(&cli.shm_name, cli.shm_size)?;
+        let mut shm = ShmTransport::create_or_open(cli.shm_name(), cli.shm_size())?;
         shm.register_instance(instance_id)?;
 
         let chunk_size =
             (shm.capacity() as usize / 4).clamp(MIN_CHUNK_SIZE, chunker::DEFAULT_CHUNK_SIZE);
 
-        let debounce = Duration::from_millis(cli.debounce_ms);
-        let watcher = FsWatcher::new(&root, debounce, &cli.ignore)?;
+        let debounce = Duration::from_millis(cli.debounce_ms());
+        let watcher = FsWatcher::new(&root, debounce, cli.ignore())?;
 
-        let applier = ChangeApplier::new(&root, cli.conflict.clone());
+        let applier = ChangeApplier::new(&root, cli.conflict().clone());
 
         let now = Instant::now();
 
@@ -75,7 +75,7 @@ impl SyncEngine {
             applier,
             seq: 0,
             chunk_size,
-            ignore_dirs: cli.ignore.clone(),
+            ignore_dirs: cli.ignore().to_vec(),
             running,
             last_remote_heartbeat: now,
             last_heartbeat_sent: now,
@@ -335,14 +335,12 @@ impl SyncEngine {
                 .collect_events_timeout(&self.root, REMOTE_POLL_INTERVAL);
             let local_events: Vec<SyncEvent> = raw_events
                 .into_iter()
-                .filter(|e| {
-                    match e.path() {
-                        Some(p) if self.suppressed_paths.contains(p) => {
-                            debug!("Suppressing echo event for {}", p.display());
-                            false
-                        }
-                        _ => true,
+                .filter(|e| match e.path() {
+                    Some(p) if self.suppressed_paths.contains(p) => {
+                        debug!("Suppressing echo event for {}", p.display());
+                        false
                     }
+                    _ => true,
                 })
                 .collect();
             // Clear suppressed paths — they've been used for this iteration
@@ -372,19 +370,20 @@ impl SyncEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cli::ConflictStrategy;
+    use crate::cli::{Command, ConflictStrategy, RunArgs};
     use tempfile::TempDir;
 
     fn make_engine(dir: &std::path::Path) -> SyncEngine {
         let cli = Cli {
-            input: dir.to_path_buf(),
-            shm_name: format!("dirsync_sync_test_{}", std::process::id()),
-            shm_size: 65536,
-            verbose: 0,
-            conflict: ConflictStrategy::LastWriteWins,
-            debounce_ms: 50,
-            instance: None,
-            ignore: vec![],
+            command: Command::Host(RunArgs {
+                input: dir.to_path_buf(),
+                shm_name: format!("dirsync_sync_test_{}", std::process::id()),
+                shm_size: 65536,
+                verbose: 0,
+                conflict: ConflictStrategy::LastWriteWins,
+                debounce_ms: 50,
+                ignore: vec![],
+            }),
         };
         SyncEngine::new(0, &cli, Arc::new(AtomicBool::new(true))).unwrap()
     }
@@ -428,14 +427,15 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let running = Arc::new(AtomicBool::new(false));
         let cli = Cli {
-            input: dir.path().to_path_buf(),
-            shm_name: format!("dirsync_shutdown_test_{}", std::process::id()),
-            shm_size: 65536,
-            verbose: 0,
-            conflict: ConflictStrategy::LastWriteWins,
-            debounce_ms: 50,
-            instance: None,
-            ignore: vec![],
+            command: Command::Host(RunArgs {
+                input: dir.path().to_path_buf(),
+                shm_name: format!("dirsync_shutdown_test_{}", std::process::id()),
+                shm_size: 65536,
+                verbose: 0,
+                conflict: ConflictStrategy::LastWriteWins,
+                debounce_ms: 50,
+                ignore: vec![],
+            }),
         };
         let mut engine = SyncEngine::new(0, &cli, running).unwrap();
         engine.watcher.seed_tracker(dir.path(), &[]);

@@ -31,20 +31,24 @@ Open two terminals and point each at a directory to sync:
 
 ```bash
 # Terminal 1
-dirsync -i /path/to/directory-a
+dirsync host -i /path/to/directory-a
 
 # Terminal 2
-dirsync -i /path/to/directory-b
+dirsync join -i /path/to/directory-b
 ```
 
-The first instance creates the shared memory segment; the second connects to it. Changes in either directory are automatically synced to the other.
+The host creates the shared memory segment; the join process connects to it. Changes in either directory are automatically synced to the other.
 
 ### Options
 
 ```
-Usage: dirsync [OPTIONS] --input <INPUT>
+Usage: dirsync <COMMAND>
 
-Options:
+Commands:
+  host  Start the first process in a sync pair
+  join  Join an existing sync pair
+
+Command options:
   -i, --input <INPUT>              Directory to monitor and sync
       --shm-name <SHM_NAME>        Shared memory segment name [default: dirsync_shm]
       --shm-size <SHM_SIZE>        Shared memory size in bytes [default: 67108864]
@@ -60,16 +64,19 @@ Options:
 
 ```bash
 # Sync with verbose logging
-dirsync -i ./project-a -v
+dirsync host -i ./project-a -v
 
 # Custom shared memory name (for multiple sync pairs)
-dirsync -i ./docs --shm-name docs_sync
+dirsync host -i ./docs-a --shm-name docs_sync
+dirsync join -i ./docs-b --shm-name docs_sync
 
 # Ignore node_modules and .git
-dirsync -i ./src --ignore node_modules --ignore .git
+dirsync host -i ./src-a --ignore node_modules --ignore .git
+dirsync join -i ./src-b --ignore node_modules --ignore .git
 
 # Keep both copies on conflict
-dirsync -i ./work --conflict keep-both
+dirsync host -i ./work-a --conflict keep-both
+dirsync join -i ./work-b --conflict keep-both
 ```
 
 ## Architecture
@@ -133,7 +140,7 @@ cargo clippy -- -D warnings
 cargo test
 
 # Run with debug logging
-RUST_LOG=debug cargo run -- -i ./test-dir -v
+RUST_LOG=debug cargo run -- host -i ./test-dir -v
 ```
 
 ## License

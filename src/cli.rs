@@ -1,4 +1,4 @@
-use clap::Parser;
+use clap::{Args, Parser, Subcommand};
 use std::path::PathBuf;
 
 /// dirsync - Directory synchronization over shared memory
@@ -7,11 +7,25 @@ use std::path::PathBuf;
 /// file/folder changes to each other via shared memory.
 ///
 /// Usage:
-///   dirsync -i /path/to/dir1    # Instance 1
-///   dirsync -i /path/to/dir2    # Instance 2
+///   dirsync host -i /path/to/dir1
+///   dirsync join -i /path/to/dir2
 #[derive(Parser, Debug)]
 #[command(name = "dirsync", version, about, long_about = None)]
 pub struct Cli {
+    #[command(subcommand)]
+    pub command: Command,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum Command {
+    /// Start the first process in a sync pair.
+    Host(RunArgs),
+    /// Join an existing sync pair.
+    Join(RunArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct RunArgs {
     /// Directory to monitor and sync
     #[arg(short, long)]
     pub input: PathBuf,
@@ -36,13 +50,78 @@ pub struct Cli {
     #[arg(long, default_value_t = 100)]
     pub debounce_ms: u64,
 
-    /// Instance ID (0 or 1). Must be different for each process in a sync pair.
-    #[arg(long, value_parser = clap::value_parser!(u64).range(0..=1))]
-    pub instance: Option<u64>,
-
     /// Directories to ignore (can be specified multiple times)
     #[arg(long)]
     pub ignore: Vec<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Role {
+    Host,
+    Join,
+}
+
+impl Role {
+    pub fn instance_id(self) -> u64 {
+        match self {
+            Self::Host => 0,
+            Self::Join => 1,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Host => "host",
+            Self::Join => "join",
+        }
+    }
+}
+
+impl Cli {
+    pub fn role(&self) -> Role {
+        match &self.command {
+            Command::Host(_) => Role::Host,
+            Command::Join(_) => Role::Join,
+        }
+    }
+
+    pub fn args(&self) -> &RunArgs {
+        match &self.command {
+            Command::Host(args) | Command::Join(args) => args,
+        }
+    }
+
+    pub fn input(&self) -> &PathBuf {
+        &self.args().input
+    }
+
+    pub fn shm_name(&self) -> &str {
+        &self.args().shm_name
+    }
+
+    pub fn shm_size(&self) -> usize {
+        self.args().shm_size
+    }
+
+    pub fn verbose(&self) -> u8 {
+        self.args().verbose
+    }
+
+    pub fn conflict(&self) -> &ConflictStrategy {
+        &self.args().conflict
+    }
+
+    pub fn debounce_ms(&self) -> u64 {
+        self.args().debounce_ms
+    }
+
+    pub fn ignore(&self) -> &[String] {
+        &self.args().ignore
+    }
+
+    pub fn instance_id(&self) -> u64 {
+        self.role().instance_id()
+    }
 }
 
 #[derive(clap::ValueEnum, Clone, Debug, PartialEq)]
