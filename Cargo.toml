@@ -2,5 +2,36 @@
 name = "dirsync"
 version = "0.1.0"
 edition = "2024"
+description = "Directory synchronization over shared memory"
 
 [dependencies]
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# File system
+notify = "8"
+walkdir = "2"
+
+# Shared memory
+shared_memory = "0.12"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+bincode = "1"
+
+# Hashing
+blake3 = "1"
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# Error handling & logging
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Utility
+chrono = { version = "0.4", features = ["serde"] }
+
+[dev-dependencies]
+tempfile = "3"

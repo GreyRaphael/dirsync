@@ -10,24 +10,27 @@
 
 ```mermaid
 graph TB
-    subgraph "进程 A (dirsync -i dir1)"
-        WA[File Watcher<br/>notify] --> CA[Change Detector]
+    subgraph PA["进程 A (dirsync -i dir1)"]
+        WA[File Watcher - notify] --> CA[Change Detector]
         CA --> SWA[SHM Writer]
-        SWA --> SHA[Shared Memory Buffer A]
-        SRA[SHM Reader] --> MA[Apply Changes<br/>to dir1]
+        SRA[SHM Reader] --> MA[Apply Changes to dir1]
     end
 
-    subgraph "共享内存"
-        SHA -->|Ring Buffer| SRB[SHM Reader]
-        SHB[Shared Memory Buffer B] -->|Ring Buffer| SRA
+    subgraph SHM["共享内存 (Shared Memory)"]
+        SHA[Ring Buffer A] --> SRB[SHM Reader B]
+        SHB[Ring Buffer B] --> SRA2[SHM Reader A]
     end
 
-    subgraph "进程 B (dirsync -i dir2)"
-        WB[File Watcher<br/>notify] --> CB[Change Detector]
+    subgraph PB["进程 B (dirsync -i dir2)"]
+        WB[File Watcher - notify] --> CB[Change Detector]
         CB --> SWB[SHM Writer]
-        SWB --> SHB[Shared Memory Buffer B]
-        SRB --> MB[Apply Changes<br/>to dir2]
+        SRB2[SHM Reader] --> MB[Apply Changes to dir2]
     end
+
+    SWA --> SHA
+    SWB --> SHB
+    SRA2 --> SRA
+    SRB --> SRB2
 
     style SHA fill:#f9f,stroke:#333,stroke-width:2px
     style SHB fill:#f9f,stroke:#333,stroke-width:2px
@@ -37,10 +40,10 @@ graph TB
 
 ```mermaid
 graph LR
-    subgraph "Shared Memory Layout"
-        H[Header<br/>magic | version<br/>seq_a | seq_b<br/>lock_a | lock_b]
-        RB[Ring Buffer<br/>Event Queue]
-        DC[Data Chunk Pool<br/>File Content Blocks]
+    subgraph SML["Shared Memory Layout"]
+        H["Header<br/>magic · version · seq_a · seq_b<br/>lock_a · lock_b"]
+        RB["Ring Buffer<br/>Event Queue"]
+        DC["Data Chunk Pool<br/>File Content Blocks"]
     end
 
     H --> RB
