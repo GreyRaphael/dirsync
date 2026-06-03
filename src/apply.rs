@@ -8,7 +8,6 @@ use std::fs;
 use std::path::{Component, Path, PathBuf};
 use tracing::{debug, info, warn};
 
-/// Cached state for conflict detection: path → (hash, size).
 type FileHashMap = HashMap<PathBuf, ([u8; 32], u64)>;
 
 struct PendingFileTransfer {
@@ -17,20 +16,12 @@ struct PendingFileTransfer {
     temp_path: PathBuf,
 }
 
-/// Apply received SyncEvents to the local directory.
 pub struct ChangeApplier {
     root: PathBuf,
     root_canonical: PathBuf,
-    #[allow(dead_code)]
     conflict_strategy: ConflictStrategy,
-    /// The hash of the file as last confirmed synced and committed to the final path.
-    /// Pending chunk transfers do not update this baseline until their expected
-    /// size and content hash have been verified.
     last_synced_hash: FileHashMap,
-    /// Files currently being assembled from remote chunks.
     pending_remote_files: HashMap<PathBuf, PendingFileTransfer>,
-    /// Files whose metadata event was skipped due to a conflict; ignore their
-    /// following content chunks until a new metadata event starts a transfer.
     blocked_remote_files: HashSet<PathBuf>,
 }
 
@@ -136,39 +127,50 @@ impl ChangeApplier {
         Ok(target)
     }
 
-    /// Apply a batch of events to the local directory.
-    ///
-    /// Returns a list of events that were skipped due to conflict resolution.
-    pub fn apply_events(&mut self, events: &[SyncEvent]) -> Result<Vec<ConflictInfo>> {
+    pub fn apply_events(
+        &mut self,
+        events: &[SyncEvent],
+        remote_timestamp: i64,
+    ) -> Result<Vec<ConflictInfo>> {
         let mut conflicts = Vec::new();
         for event in events {
-            if let Some(conflict) = self.apply_event(event)? {
+            if let Some(conflict) = self.apply_event(event, remote_timestamp)? {
                 conflicts.push(conflict);
             }
         }
         Ok(conflicts)
     }
 
-    /// Apply a single event to the local directory.
-    pub fn apply_event(&mut self, event: &SyncEvent) -> Result<Option<ConflictInfo>> {
-        self.apply_single(event)
+    pub fn apply_event(
+        &mut self,
+        event: &SyncEvent,
+        remote_timestamp: i64,
+    ) -> Result<Option<ConflictInfo>> {
+        self.apply_single(event, remote_timestamp)
     }
 
-    /// Check if applying a remote file event would conflict with local changes.
-    ///
-    /// Returns Some(conflict info) if there's a conflict, None otherwise.
+    fn local_mtime_millis(path: &Path) -> i64 {
+        fs::metadata(path)
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0)
+    }
+
     fn detect_conflict(
         &self,
         path: &Path,
         remote_hash: &[u8; 32],
         remote_size: u64,
+        remote_timestamp: i64,
     ) -> Option<ConflictInfo> {
         let full_path = match self.safe_target_path(path) {
             Ok(path) => path,
             Err(_) => return None,
         };
         if !full_path.exists() {
-            return None; // No local file, no conflict
+            return None;
         }
 
         let (local_hash, local_size) = match file_hash_and_size(&full_path) {
@@ -176,30 +178,40 @@ impl ChangeApplier {
             Err(_) => return None,
         };
 
-        // If the local file matches the remote, no conflict
         if local_hash == *remote_hash {
             return None;
         }
 
-        // Check if we have a last-synced hash for this file
         if let Some((synced_hash, _)) = self.last_synced_hash.get(path) {
-            // If local hash matches what was last synced, local hasn't changed — no conflict
             if local_hash == *synced_hash {
                 return None;
             }
-            // Local differs from both remote and last-synced → conflict
-            return Some(ConflictInfo {
-                path: path.to_path_buf(),
-                local_hash,
-                local_size,
-                remote_hash: *remote_hash,
-                remote_size,
-            });
+
+            return match self.conflict_strategy {
+                ConflictStrategy::LastWriteWins => {
+                    let local_mtime = Self::local_mtime_millis(&full_path);
+                    if remote_timestamp >= local_mtime {
+                        None
+                    } else {
+                        Some(ConflictInfo {
+                            path: path.to_path_buf(),
+                            local_hash,
+                            local_size,
+                            remote_hash: *remote_hash,
+                            remote_size,
+                        })
+                    }
+                }
+                ConflictStrategy::KeepBoth => Some(ConflictInfo {
+                    path: path.to_path_buf(),
+                    local_hash,
+                    local_size,
+                    remote_hash: *remote_hash,
+                    remote_size,
+                }),
+            };
         }
 
-        // No prior sync record. File exists locally with different content.
-        // Could be a conflict (both sides created same path) or just a first sync.
-        // We can't tell without prior state, so allow it (no conflict).
         None
     }
 
@@ -355,8 +367,6 @@ impl ChangeApplier {
                 .with_context(|| format!("Failed to create parent dir: {}", parent.display()))?;
         }
 
-        // Compatibility path for tests/older senders that provide content without
-        // a metadata event. Real transfers go through `pending_remote_files`.
         let truncate = offset == 0;
         let mut file = fs::OpenOptions::new()
             .create(true)
@@ -376,16 +386,52 @@ impl ChangeApplier {
         Ok(())
     }
 
-    fn apply_single(&mut self, event: &SyncEvent) -> Result<Option<ConflictInfo>> {
+    fn apply_single(
+        &mut self,
+        event: &SyncEvent,
+        remote_timestamp: i64,
+    ) -> Result<Option<ConflictInfo>> {
         match event {
             SyncEvent::FileCreated {
                 path,
                 content_hash,
                 size,
             } => {
+                let mut resolved_conflict = None;
+                if let Some(conflict) =
+                    self.detect_conflict(path, content_hash, *size, remote_timestamp)
+                {
+                    match self.conflict_strategy {
+                        ConflictStrategy::LastWriteWins => {
+                            warn!(
+                                "Conflict on create {} — keeping local (LWW)",
+                                path.display()
+                            );
+                            self.blocked_remote_files.insert(path.clone());
+                            return Ok(Some(conflict));
+                        }
+                        ConflictStrategy::KeepBoth => {
+                            info!(
+                                "Conflict on create {} — keeping both versions",
+                                path.display()
+                            );
+                            if let Ok(full_path) = self.safe_target_path(path)
+                                && full_path.exists()
+                            {
+                                let copy = keep_both_path(&full_path, "local");
+                                if let Err(e) = fs::rename(&full_path, &copy) {
+                                    warn!("Failed to rename local copy: {}", e);
+                                } else {
+                                    info!("Renamed local copy to {}", copy.display());
+                                }
+                            }
+                            resolved_conflict = Some(conflict);
+                        }
+                    }
+                }
                 self.prepare_transfer(path, *content_hash, *size)?;
                 debug!("Prepared file create: {} ({} bytes)", path.display(), size);
-                Ok(None)
+                Ok(resolved_conflict)
             }
 
             SyncEvent::FileModified {
@@ -393,22 +439,45 @@ impl ChangeApplier {
                 content_hash,
                 size,
             } => {
-                // Check for conflict: local changed since we last synced this file
-                if let Some(conflict) = self.detect_conflict(path, content_hash, *size) {
-                    warn!(
-                        "Conflict on modify {} (local={}B, remote={}B)",
-                        path.display(),
-                        conflict.local_size,
-                        conflict.remote_size
-                    );
-                    self.pending_remote_files.remove(path);
-                    self.blocked_remote_files.insert(path.clone());
-                    return Ok(Some(conflict));
+                let mut resolved_conflict = None;
+                if let Some(conflict) =
+                    self.detect_conflict(path, content_hash, *size, remote_timestamp)
+                {
+                    match self.conflict_strategy {
+                        ConflictStrategy::LastWriteWins => {
+                            warn!(
+                                "Conflict on modify {} (local={}B, remote={}B) — keeping local (LWW)",
+                                path.display(),
+                                conflict.local_size,
+                                conflict.remote_size
+                            );
+                            self.pending_remote_files.remove(path);
+                            self.blocked_remote_files.insert(path.clone());
+                            return Ok(Some(conflict));
+                        }
+                        ConflictStrategy::KeepBoth => {
+                            info!(
+                                "Conflict on modify {} — keeping both versions",
+                                path.display()
+                            );
+                            if let Ok(full_path) = self.safe_target_path(path)
+                                && full_path.exists()
+                            {
+                                let copy = keep_both_path(&full_path, "local");
+                                if let Err(e) = fs::rename(&full_path, &copy) {
+                                    warn!("Failed to rename local copy: {}", e);
+                                } else {
+                                    info!("Renamed local copy to {}", copy.display());
+                                }
+                            }
+                            resolved_conflict = Some(conflict);
+                        }
+                    }
                 }
 
                 self.prepare_transfer(path, *content_hash, *size)?;
                 debug!("Prepared file modify: {} ({} bytes)", path.display(), size);
-                Ok(None)
+                Ok(resolved_conflict)
             }
 
             SyncEvent::FileDeleted { path } => {
@@ -478,7 +547,38 @@ impl ChangeApplier {
     }
 }
 
-/// Information about a detected conflict.
+fn keep_both_path(original: &Path, tag: &str) -> PathBuf {
+    let parent = original.parent().unwrap_or(Path::new("."));
+    let file_name = original
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy();
+
+    let make_name = |suffix: &str| -> String {
+        match file_name.rfind('.') {
+            Some(pos) => {
+                let (stem, ext) = file_name.split_at(pos);
+                format!("{}.{}{}", stem, suffix, ext)
+            }
+            None => format!("{}.{}", file_name, suffix),
+        }
+    };
+
+    let candidate = parent.join(make_name(tag));
+    if !candidate.exists() {
+        return candidate;
+    }
+
+    for i in 1..1000 {
+        let numbered = parent.join(make_name(&format!("{}.{}", tag, i)));
+        if !numbered.exists() {
+            return numbered;
+        }
+    }
+
+    candidate
+}
+
 #[derive(Debug)]
 pub struct ConflictInfo {
     pub path: PathBuf,
@@ -492,6 +592,8 @@ pub struct ConflictInfo {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    const NOW: i64 = 1_700_000_000_000;
 
     fn setup(strategy: ConflictStrategy) -> (TempDir, ChangeApplier) {
         let dir = TempDir::new().unwrap();
@@ -509,7 +611,7 @@ mod tests {
         let events = vec![SyncEvent::DirCreated {
             path: PathBuf::from("subdir"),
         }];
-        applier.apply_events(&events).unwrap();
+        applier.apply_events(&events, NOW).unwrap();
         assert!(dir.path().join("subdir").is_dir());
     }
 
@@ -521,7 +623,7 @@ mod tests {
         let events = vec![SyncEvent::DirDeleted {
             path: PathBuf::from("to_delete"),
         }];
-        applier.apply_events(&events).unwrap();
+        applier.apply_events(&events, NOW).unwrap();
         assert!(!dir.path().join("to_delete").exists());
     }
 
@@ -533,7 +635,7 @@ mod tests {
             content_hash: [0u8; 32],
             size: 0,
         }];
-        applier.apply_events(&events).unwrap();
+        applier.apply_events(&events, NOW).unwrap();
         assert!(dir.path().join("new.txt").exists());
     }
 
@@ -547,9 +649,7 @@ mod tests {
             content_hash: [1u8; 32],
             size: 1,
         }];
-        let conflicts = applier.apply_events(&events).unwrap();
-        // No conflict on first sync, and existing content is preserved until
-        // the remote content chunks are complete and verified.
+        let conflicts = applier.apply_events(&events, NOW).unwrap();
         assert!(conflicts.is_empty());
         assert_eq!(
             fs::read(dir.path().join("existing.txt")).unwrap(),
@@ -565,7 +665,7 @@ mod tests {
         let events = vec![SyncEvent::FileDeleted {
             path: PathBuf::from("del.txt"),
         }];
-        applier.apply_events(&events).unwrap();
+        applier.apply_events(&events, NOW).unwrap();
         assert!(!dir.path().join("del.txt").exists());
     }
 
@@ -575,7 +675,7 @@ mod tests {
         let events = vec![SyncEvent::FileDeleted {
             path: PathBuf::from("ghost.txt"),
         }];
-        assert!(applier.apply_events(&events).is_ok());
+        assert!(applier.apply_events(&events, NOW).is_ok());
     }
 
     #[test]
@@ -588,7 +688,7 @@ mod tests {
             offset: 50,
             data: vec![0xAB; 10],
         }];
-        applier.apply_events(&events).unwrap();
+        applier.apply_events(&events, NOW).unwrap();
 
         let data = fs::read(dir.path().join("chunked.bin")).unwrap();
         assert_eq!(data.len(), 100);
@@ -604,7 +704,7 @@ mod tests {
             offset: 0,
             data: b"hello".to_vec(),
         }];
-        applier.apply_events(&events).unwrap();
+        applier.apply_events(&events, NOW).unwrap();
         assert_eq!(
             fs::read(dir.path().join("deep/nested/file.txt")).unwrap(),
             b"hello"
@@ -618,11 +718,14 @@ mod tests {
         let outside_path = dir.path().parent().unwrap().join(&outside_name);
         let _ = fs::remove_file(&outside_path);
 
-        let result = applier.apply_events(&[SyncEvent::FileContent {
-            path: PathBuf::from("..").join(&outside_name),
-            offset: 0,
-            data: b"escape".to_vec(),
-        }]);
+        let result = applier.apply_events(
+            &[SyncEvent::FileContent {
+                path: PathBuf::from("..").join(&outside_name),
+                offset: 0,
+                data: b"escape".to_vec(),
+            }],
+            NOW,
+        );
 
         assert!(result.is_err());
         assert!(!outside_path.exists());
@@ -633,11 +736,14 @@ mod tests {
         let (dir, mut applier) = setup(ConflictStrategy::LastWriteWins);
         let absolute_path = dir.path().join("absolute.txt");
 
-        let result = applier.apply_events(&[SyncEvent::FileContent {
-            path: absolute_path.clone(),
-            offset: 0,
-            data: b"absolute".to_vec(),
-        }]);
+        let result = applier.apply_events(
+            &[SyncEvent::FileContent {
+                path: absolute_path.clone(),
+                offset: 0,
+                data: b"absolute".to_vec(),
+            }],
+            NOW,
+        );
 
         assert!(result.is_err());
         assert!(!absolute_path.exists());
@@ -647,11 +753,14 @@ mod tests {
     fn test_rejects_internal_temp_event_path() {
         let (_dir, mut applier) = setup(ConflictStrategy::LastWriteWins);
 
-        let result = applier.apply_events(&[SyncEvent::FileContent {
-            path: PathBuf::from(INTERNAL_TEMP_DIR).join("payload.txt"),
-            offset: 0,
-            data: b"internal".to_vec(),
-        }]);
+        let result = applier.apply_events(
+            &[SyncEvent::FileContent {
+                path: PathBuf::from(INTERNAL_TEMP_DIR).join("payload.txt"),
+                offset: 0,
+                data: b"internal".to_vec(),
+            }],
+            NOW,
+        );
 
         assert!(result.is_err());
     }
@@ -663,27 +772,33 @@ mod tests {
         let (hash, size) = hash_size(content);
 
         applier
-            .apply_events(&[
-                SyncEvent::FileCreated {
-                    path: PathBuf::from("large.bin"),
-                    content_hash: hash,
-                    size,
-                },
-                SyncEvent::FileContent {
-                    path: PathBuf::from("large.bin"),
-                    offset: 0,
-                    data: content[..5].to_vec(),
-                },
-            ])
+            .apply_events(
+                &[
+                    SyncEvent::FileCreated {
+                        path: PathBuf::from("large.bin"),
+                        content_hash: hash,
+                        size,
+                    },
+                    SyncEvent::FileContent {
+                        path: PathBuf::from("large.bin"),
+                        offset: 0,
+                        data: content[..5].to_vec(),
+                    },
+                ],
+                NOW,
+            )
             .unwrap();
         assert!(!dir.path().join("large.bin").exists());
 
         applier
-            .apply_events(&[SyncEvent::FileContent {
-                path: PathBuf::from("large.bin"),
-                offset: 5,
-                data: content[5..].to_vec(),
-            }])
+            .apply_events(
+                &[SyncEvent::FileContent {
+                    path: PathBuf::from("large.bin"),
+                    offset: 5,
+                    data: content[5..].to_vec(),
+                }],
+                NOW,
+            )
             .unwrap();
         assert_eq!(fs::read(dir.path().join("large.bin")).unwrap(), content);
     }
@@ -694,7 +809,7 @@ mod tests {
         let events = vec![SyncEvent::DirCreated {
             path: PathBuf::from("a/b/c"),
         }];
-        applier.apply_events(&events).unwrap();
+        applier.apply_events(&events, NOW).unwrap();
         assert!(dir.path().join("a/b/c").is_dir());
     }
 
@@ -702,7 +817,7 @@ mod tests {
     fn test_heartbeat_ignored() {
         let (_dir, mut applier) = setup(ConflictStrategy::LastWriteWins);
         let events = vec![SyncEvent::Heartbeat { timestamp: 12345 }];
-        assert!(applier.apply_events(&events).is_ok());
+        assert!(applier.apply_events(&events, NOW).is_ok());
     }
 
     #[test]
@@ -725,7 +840,7 @@ mod tests {
                 data: content.to_vec(),
             },
         ];
-        applier.apply_events(&events).unwrap();
+        applier.apply_events(&events, NOW).unwrap();
         assert!(dir.path().join("docs").is_dir());
         assert!(dir.path().join("docs/readme.md").exists());
         assert_eq!(
@@ -736,14 +851,13 @@ mod tests {
 
     #[test]
     fn test_no_conflict_on_first_sync() {
-        // When a file doesn't exist locally, no conflict should be detected
         let (_dir, mut applier) = setup(ConflictStrategy::LastWriteWins);
         let events = vec![SyncEvent::FileCreated {
             path: PathBuf::from("new.txt"),
             content_hash: [0xAA; 32],
             size: 100,
         }];
-        let conflicts = applier.apply_events(&events).unwrap();
+        let conflicts = applier.apply_events(&events, NOW).unwrap();
         assert!(conflicts.is_empty());
     }
 
@@ -751,80 +865,234 @@ mod tests {
     fn test_conflict_detected_when_both_changed() {
         let (dir, mut applier) = setup(ConflictStrategy::LastWriteWins);
 
-        // First sync: remote creates a file and delivers content
         let remote_data = b"remote data";
         let (remote_hash, remote_size) = hash_size(remote_data);
         applier
-            .apply_events(&[
-                SyncEvent::FileCreated {
-                    path: PathBuf::from("shared.txt"),
-                    content_hash: remote_hash,
-                    size: remote_size,
-                },
-                SyncEvent::FileContent {
-                    path: PathBuf::from("shared.txt"),
-                    offset: 0,
-                    data: remote_data.to_vec(),
-                },
-            ])
+            .apply_events(
+                &[
+                    SyncEvent::FileCreated {
+                        path: PathBuf::from("shared.txt"),
+                        content_hash: remote_hash,
+                        size: remote_size,
+                    },
+                    SyncEvent::FileContent {
+                        path: PathBuf::from("shared.txt"),
+                        offset: 0,
+                        data: remote_data.to_vec(),
+                    },
+                ],
+                NOW,
+            )
             .unwrap();
 
-        // Verify file now has content (last_synced_hash should be set)
         assert!(dir.path().join("shared.txt").exists());
 
-        // Simulate local modification
         fs::write(dir.path().join("shared.txt"), b"local change").unwrap();
 
-        // Remote sends a modification with different hash
+        // Remote timestamp far in the past — local wins under LWW
         let events = vec![SyncEvent::FileModified {
             path: PathBuf::from("shared.txt"),
             content_hash: [0xBB; 32],
             size: 20,
         }];
-        let conflicts = applier.apply_events(&events).unwrap();
-        // Conflict detected: local changed since last sync
+        let conflicts = applier.apply_events(&events, 1000).unwrap();
         assert_eq!(conflicts.len(), 1);
         assert_eq!(conflicts[0].path, PathBuf::from("shared.txt"));
     }
 
     #[test]
     fn test_no_conflict_when_remote_unchanged() {
-        let (_dir, mut applier) = setup(ConflictStrategy::LastWriteWins);
-
-        // First sync
-        let hash = [0xAA; 32];
-        let events = vec![SyncEvent::FileCreated {
-            path: PathBuf::from("shared.txt"),
-            content_hash: hash,
-            size: 10,
-        }];
-        applier.apply_events(&events).unwrap();
-
-        // Write the same content locally (hash unchanged)
-        // The file was created empty by the applier, so we write content that matches hash [0xAA;32]
-        // Actually this won't match, but the point is: if we send the SAME remote hash again,
-        // detect_conflict should see that local hash != remote hash (since local is empty)
-        // But since we're sending the same remote hash as before, it checks if local == prev_remote
-        // Local is empty (hash != [0xAA;32]), so it will detect a conflict.
-        // This is actually correct behavior — the local file was modified (written to).
-
-        // Let's test the no-conflict case: remote sends same hash, local hasn't changed
-        // We need to make local file match the remote hash
         let (dir2, mut applier2) = setup(ConflictStrategy::LastWriteWins);
 
-        // Create file locally with known content
         let content = b"test content";
         fs::write(dir2.path().join("file.txt"), content).unwrap();
         let (local_hash, local_size) = file_hash_and_size(&dir2.path().join("file.txt")).unwrap();
 
-        // Remote creates with same hash
         let events = vec![SyncEvent::FileCreated {
             path: PathBuf::from("file.txt"),
             content_hash: local_hash,
             size: local_size,
         }];
-        let conflicts = applier2.apply_events(&events).unwrap();
-        // No conflict because local hash matches remote
+        let conflicts = applier2.apply_events(&events, NOW).unwrap();
         assert!(conflicts.is_empty());
+    }
+
+    #[test]
+    fn test_lww_remote_wins_when_newer() {
+        let (dir, mut applier) = setup(ConflictStrategy::LastWriteWins);
+
+        let v1 = b"version one";
+        let (h1, s1) = hash_size(v1);
+        applier
+            .apply_events(
+                &[
+                    SyncEvent::FileCreated {
+                        path: PathBuf::from("f.txt"),
+                        content_hash: h1,
+                        size: s1,
+                    },
+                    SyncEvent::FileContent {
+                        path: PathBuf::from("f.txt"),
+                        offset: 0,
+                        data: v1.to_vec(),
+                    },
+                ],
+                NOW,
+            )
+            .unwrap();
+
+        fs::write(dir.path().join("f.txt"), b"local edit").unwrap();
+
+        // Remote timestamp far in the future — remote wins under LWW
+        let future_ts: i64 = 9_999_999_999_999;
+        let conflicts = applier
+            .apply_events(
+                &[SyncEvent::FileModified {
+                    path: PathBuf::from("f.txt"),
+                    content_hash: [0xCC; 32],
+                    size: 30,
+                }],
+                future_ts,
+            )
+            .unwrap();
+        assert!(conflicts.is_empty());
+    }
+
+    #[test]
+    fn test_lww_local_wins_when_newer() {
+        let (dir, mut applier) = setup(ConflictStrategy::LastWriteWins);
+
+        let v1 = b"version one";
+        let (h1, s1) = hash_size(v1);
+        applier
+            .apply_events(
+                &[
+                    SyncEvent::FileCreated {
+                        path: PathBuf::from("f.txt"),
+                        content_hash: h1,
+                        size: s1,
+                    },
+                    SyncEvent::FileContent {
+                        path: PathBuf::from("f.txt"),
+                        offset: 0,
+                        data: v1.to_vec(),
+                    },
+                ],
+                NOW,
+            )
+            .unwrap();
+
+        fs::write(dir.path().join("f.txt"), b"local edit").unwrap();
+
+        // Remote timestamp far in the past — local wins under LWW
+        let conflicts = applier
+            .apply_events(
+                &[SyncEvent::FileModified {
+                    path: PathBuf::from("f.txt"),
+                    content_hash: [0xDD; 32],
+                    size: 50,
+                }],
+                1000,
+            )
+            .unwrap();
+        assert_eq!(conflicts.len(), 1);
+        assert_eq!(
+            fs::read(dir.path().join("f.txt")).unwrap(),
+            b"local edit"
+        );
+    }
+
+    #[test]
+    fn test_keep_both_creates_local_copy() {
+        let (dir, mut applier) = setup(ConflictStrategy::KeepBoth);
+
+        let original = b"original  ";
+        let (oh, os) = hash_size(original);
+        applier
+            .apply_events(
+                &[
+                    SyncEvent::FileCreated {
+                        path: PathBuf::from("doc.txt"),
+                        content_hash: oh,
+                        size: os,
+                    },
+                    SyncEvent::FileContent {
+                        path: PathBuf::from("doc.txt"),
+                        offset: 0,
+                        data: original.to_vec(),
+                    },
+                ],
+                NOW,
+            )
+            .unwrap();
+
+        fs::write(dir.path().join("doc.txt"), b"my changes").unwrap();
+
+        let remote_hash = [0xEE; 32];
+        let conflicts = applier
+            .apply_events(
+                &[SyncEvent::FileModified {
+                    path: PathBuf::from("doc.txt"),
+                    content_hash: remote_hash,
+                    size: 15,
+                }],
+                NOW,
+            )
+            .unwrap();
+
+        assert_eq!(conflicts.len(), 1);
+        assert!(dir.path().join("doc.local.txt").exists());
+        assert_eq!(
+            fs::read(dir.path().join("doc.local.txt")).unwrap(),
+            b"my changes"
+        );
+    }
+
+    #[test]
+    fn test_keep_both_avoids_overwrite() {
+        let (dir, mut applier) = setup(ConflictStrategy::KeepBoth);
+
+        // Pre-existing .local.txt should cause numbered suffix
+        fs::write(dir.path().join("f.txt"), b"old local").unwrap();
+        fs::write(dir.path().join("f.local.txt"), b"already exists").unwrap();
+
+        let original = b"original";
+        let (oh, os) = hash_size(original);
+        applier
+            .apply_events(
+                &[
+                    SyncEvent::FileCreated {
+                        path: PathBuf::from("f.txt"),
+                        content_hash: oh,
+                        size: os,
+                    },
+                    SyncEvent::FileContent {
+                        path: PathBuf::from("f.txt"),
+                        offset: 0,
+                        data: original.to_vec(),
+                    },
+                ],
+                NOW,
+            )
+            .unwrap();
+
+        fs::write(dir.path().join("f.txt"), b"new local").unwrap();
+
+        applier
+            .apply_events(
+                &[SyncEvent::FileModified {
+                    path: PathBuf::from("f.txt"),
+                    content_hash: [0xFF; 32],
+                    size: 20,
+                }],
+                NOW,
+            )
+            .unwrap();
+
+        assert!(dir.path().join("f.local.1.txt").exists());
+        assert_eq!(
+            fs::read(dir.path().join("f.local.1.txt")).unwrap(),
+            b"new local"
+        );
     }
 }

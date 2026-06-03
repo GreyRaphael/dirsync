@@ -5,21 +5,15 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 use tracing::{debug, trace};
 
-/// Sentinel length value indicating a wrap-around padding in the ring buffer.
-/// When the reader encounters this value, it resets its cursor to offset 0.
 const WRAP_SENTINEL: u32 = 0xFFFFFFFF;
 
-/// Maximum spin iterations before declaring lock deadlock.
 const MAX_SPIN: u32 = 2_000_000;
 
-/// How long a producer waits for readers to free ring-buffer space.
 const PUSH_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
 const PUSH_RETRY_SLEEP: Duration = Duration::from_millis(10);
 
-/// Smallest segment that can hold the header and a non-empty ring buffer.
 const MIN_SHM_SIZE: usize = SHM_HEADER_SIZE + 8;
 
-/// Ring buffer based shared memory transport for SyncEvents.
 pub struct ShmTransport {
     shmem: Shmem,
     shm_name: String,
@@ -81,7 +75,6 @@ impl ShmTransport {
         Ok(())
     }
 
-    /// Create a new shared memory segment (first instance).
     pub fn create(name: &str, total_size: usize) -> Result<Self> {
         Self::validate_total_size(total_size)?;
 
@@ -109,7 +102,6 @@ impl ShmTransport {
         Ok(shm)
     }
 
-    /// Open an existing shared memory segment (second instance).
     pub fn open(name: &str) -> Result<Self> {
         let shmem = ShmemConf::new()
             .flink(name)
@@ -140,7 +132,6 @@ impl ShmTransport {
         Ok(shm)
     }
 
-    /// Create or open shared memory depending on whether it already exists.
     pub fn create_or_open(name: &str, total_size: usize) -> Result<Self> {
         match Self::open(name) {
             Ok(shm) => Ok(shm),
@@ -171,33 +162,53 @@ impl ShmTransport {
         unsafe { self.base_ptr().add(SHM_HEADER_SIZE) }
     }
 
-    /// Get a pointer to the global ring-buffer lock.
-    fn lock_ptr(&self, _instance_id: u64) -> *const AtomicU32 {
+    fn lock_ptr(&self) -> *const AtomicU32 {
         let header = self.base_ptr() as *const ShmHeader;
         unsafe { &(*header).lock_a as *const u32 as *const AtomicU32 }
     }
 
-    /// Acquire the spinlock with a timeout to prevent deadlock.
+    /// Acquire the spinlock.  The lock value encodes the holder's
+    /// `instance_id + 1` (1 for instance 0, 2 for instance 1) so that a
+    /// force-reclaim path can verify the holder is no longer active before
+    /// breaking the lock.
     ///
-    /// Returns `Some(lock)` on success, `None` on timeout.
+    /// Returns `Some(lock)` on success, `None` on timeout / refused reclaim.
     fn try_acquire_lock(&self, instance_id: u64) -> Option<&AtomicU32> {
-        let lock = unsafe { &*self.lock_ptr(instance_id) };
-        let mut spins = 0;
+        let lock = unsafe { &*self.lock_ptr() };
+        let my_value = (instance_id + 1) as u32;
+        let mut spins = 0u32;
         while lock
-            .compare_exchange_weak(0, 1, Ordering::Acquire, Ordering::Relaxed)
+            .compare_exchange_weak(0, my_value, Ordering::Acquire, Ordering::Relaxed)
             .is_err()
         {
             spins += 1;
             if spins >= MAX_SPIN {
-                // Force-reclaim the lock: the holder likely crashed
-                lock.store(0, Ordering::Relaxed);
-                tracing::warn!("Lock timeout for instance {}, force-reclaimed", instance_id);
-                // Try once more
-                if lock
-                    .compare_exchange_weak(0, 1, Ordering::Acquire, Ordering::Relaxed)
-                    .is_ok()
-                {
-                    return Some(lock);
+                let current = lock.load(Ordering::Relaxed);
+                let holder_id = current.saturating_sub(1) as u64;
+                let header = unsafe { self.read_header() };
+                let holder_bit = 1u32 << holder_id;
+
+                if header.active_mask & holder_bit == 0 {
+                    // Holder has unregistered — safe to reclaim.
+                    lock.store(0, Ordering::Relaxed);
+                    tracing::warn!(
+                        "Lock held by inactive instance {}, force-reclaimed",
+                        holder_id
+                    );
+                    if lock
+                        .compare_exchange_weak(0, my_value, Ordering::Acquire, Ordering::Relaxed)
+                        .is_ok()
+                    {
+                        return Some(lock);
+                    }
+                } else {
+                    // Holder is still active — do NOT reclaim to avoid data
+                    // corruption from concurrent read/write.
+                    tracing::warn!(
+                        "Lock held by active instance {} (us={}), refusing force-reclaim",
+                        holder_id,
+                        instance_id
+                    );
                 }
                 return None;
             }
@@ -210,11 +221,6 @@ impl ShmTransport {
         lock.store(0, Ordering::Release);
     }
 
-    /// Mark an instance as active in the shared-memory header.
-    ///
-    /// The read cursor starts at the current write cursor so a restarted process
-    /// does not try to consume stale frames from before it joined. The initial
-    /// directory scan is responsible for reconciling state after startup.
     pub fn register_instance(&mut self, instance_id: u64) -> Result<()> {
         if instance_id > 1 {
             anyhow::bail!("Invalid instance_id {}, expected 0 or 1", instance_id);
@@ -246,7 +252,6 @@ impl ShmTransport {
         Ok(())
     }
 
-    /// Return the current active-instance bitmask.
     pub fn active_mask(&self) -> u32 {
         let header = unsafe { self.read_header() };
         header.active_mask
@@ -274,8 +279,29 @@ impl ShmTransport {
         );
     }
 
-    /// Compute free bytes in the ring buffer.
-    /// Must be called while holding the lock.
+    /// Force-clear a peer's `active_mask` bit after the peer has been detected
+    /// as offline (heartbeat timeout).  This prevents a dead reader from
+    /// blocking the ring-buffer writer.
+    pub fn force_unregister_peer(&self, peer_instance_id: u64) -> Result<()> {
+        let lock = self
+            .try_acquire_lock(peer_instance_id)
+            .ok_or_else(|| anyhow::anyhow!("Failed to acquire lock for peer cleanup"))?;
+
+        let header_mut = unsafe { &mut *(self.base_ptr() as *mut ShmHeader) };
+        let peer_bit = 1u32 << peer_instance_id;
+        if header_mut.active_mask & peer_bit != 0 {
+            header_mut.active_mask &= !peer_bit;
+            tracing::warn!(
+                "Force-unregistered peer {} (active_mask={:#04b})",
+                peer_instance_id,
+                header_mut.active_mask
+            );
+        }
+
+        Self::release_lock(lock);
+        Ok(())
+    }
+
     fn free_bytes_locked(&self) -> u32 {
         fn used_between(read: u32, write: u32, cap: u32) -> u32 {
             if write >= read {
@@ -291,8 +317,6 @@ impl ShmTransport {
         let active_mask = header.active_mask & 0b11;
         let mut used = 0;
 
-        // If no instances have registered (unit tests and direct transport
-        // usage), preserve the original two-reader behavior.
         if active_mask == 0 || active_mask & 0b01 != 0 {
             used = used.max(used_between(header.rb_read_a, w, cap));
         }
@@ -300,18 +324,13 @@ impl ShmTransport {
             used = used.max(used_between(header.rb_read_b, w, cap));
         }
 
-        // Keep one byte empty so rb_read == rb_write always means empty.
         cap.saturating_sub(used).saturating_sub(1)
     }
 
-    /// Push an event envelope into the ring buffer.
-    ///
-    /// Frame layout: `[u32 len][bytes data]`
-    /// Wrap sentinel: `[u32 0xFFFFFFFF]` written at tail when not enough space.
     pub fn push_event(&self, instance_id: u64, envelope: &EventEnvelope) -> Result<()> {
         let encoded = bincode::serialize(envelope).context("Failed to serialize event")?;
         let data_len = encoded.len() as u32;
-        let frame_len = 4 + data_len; // u32 prefix + data
+        let frame_len = 4 + data_len;
         let deadline = Instant::now() + PUSH_WAIT_TIMEOUT;
 
         loop {
@@ -323,8 +342,6 @@ impl ShmTransport {
             let cap = header.rb_capacity;
             let w = header.rb_write;
 
-            // Reject frames that can never fit. Reserve a few bytes for wrap
-            // sentinel/empty-space disambiguation.
             if frame_len > cap.saturating_sub(4) {
                 Self::release_lock(lock);
                 anyhow::bail!(
@@ -379,7 +396,6 @@ impl ShmTransport {
                 w
             };
 
-            // Write frame: [u32 len][data]
             unsafe {
                 std::ptr::copy_nonoverlapping(
                     data_len.to_le_bytes().as_ptr(),
@@ -393,13 +409,10 @@ impl ShmTransport {
                 );
             }
 
-            // Update header atomically: rb_write first (data is visible), then seq.
-            // The reader checks rb_write to know where data ends; seq is informational.
             let new_write = (actual_write + frame_len) % cap;
             let header_mut = unsafe { &mut *(self.base_ptr() as *mut ShmHeader) };
             header_mut.rb_write = new_write;
 
-            // Memory fence: ensure write cursor is visible before incrementing seq
             std::sync::atomic::fence(Ordering::Release);
 
             if instance_id == 0 {
@@ -418,9 +431,6 @@ impl ShmTransport {
         }
     }
 
-    /// Pop all pending events from the ring buffer for the given reader instance.
-    ///
-    /// Acquires the lock to prevent reading partially-written frames.
     pub fn pop_events(&self, instance_id: u64) -> Result<Vec<EventEnvelope>> {
         let lock = self
             .try_acquire_lock(instance_id)
@@ -447,21 +457,18 @@ impl ShmTransport {
         let mut cursor = read_offset;
 
         while cursor != write_offset {
-            // Read length prefix
             let mut len_buf = [0u8; 4];
             unsafe {
                 std::ptr::copy_nonoverlapping(rb.add(cursor as usize), len_buf.as_mut_ptr(), 4);
             }
             let len = u32::from_le_bytes(len_buf);
 
-            // Check for wrap sentinel
             if len == WRAP_SENTINEL {
                 trace!("Hit wrap sentinel at offset {}, resetting to 0", cursor);
                 cursor = 0;
                 if cursor == write_offset {
                     break;
                 }
-                // Re-read length at offset 0
                 unsafe {
                     std::ptr::copy_nonoverlapping(rb.add(0), len_buf.as_mut_ptr(), 4);
                 }
@@ -469,7 +476,6 @@ impl ShmTransport {
                 if len2 == WRAP_SENTINEL {
                     break;
                 }
-                // Read frame at offset 0
                 let data_len = len2 as usize;
                 if 4 + data_len as u32 > cap {
                     break;
@@ -489,7 +495,6 @@ impl ShmTransport {
 
             let data_len = len as usize;
 
-            // Bounds check
             if cursor + 4 + len > cap {
                 tracing::warn!(
                     "Incomplete frame at offset {} (need {} bytes, {} available)",
@@ -500,7 +505,6 @@ impl ShmTransport {
                 break;
             }
 
-            // Read data
             let mut data = vec![0u8; data_len];
             unsafe {
                 std::ptr::copy_nonoverlapping(
@@ -518,7 +522,6 @@ impl ShmTransport {
             cursor = (cursor + 4 + len) % cap;
         }
 
-        // Update read cursor
         let header_mut = unsafe { &mut *(self.base_ptr() as *mut ShmHeader) };
         if instance_id == 0 {
             header_mut.rb_read_a = cursor;
@@ -536,7 +539,6 @@ impl ShmTransport {
         Ok(events)
     }
 
-    /// Return total capacity of the ring buffer in bytes.
     #[allow(dead_code)]
     pub fn capacity(&self) -> u32 {
         let header = unsafe { self.read_header() };
@@ -740,5 +742,27 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].seq, 99);
         assert!(matches!(events[0].event, SyncEvent::Heartbeat { .. }));
+    }
+
+    #[test]
+    fn test_force_unregister_peer() {
+        let name = unique_name("force_unregister");
+        let mut shm = ShmTransport::create(&name, 4096).unwrap();
+
+        shm.register_instance(0).unwrap();
+        assert_eq!(shm.active_mask() & 0b01, 0b01);
+
+        shm.force_unregister_peer(0).unwrap();
+        assert_eq!(shm.active_mask() & 0b01, 0);
+    }
+
+    #[test]
+    fn test_force_unregister_peer_noop_when_not_active() {
+        let name = unique_name("force_unregister_noop");
+        let shm = ShmTransport::create(&name, 4096).unwrap();
+
+        // Nobody registered — should succeed without error.
+        shm.force_unregister_peer(1).unwrap();
+        assert_eq!(shm.active_mask(), 0);
     }
 }

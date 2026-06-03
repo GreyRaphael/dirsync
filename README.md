@@ -8,7 +8,7 @@ Directory synchronization over shared memory — a CLI tool that keeps two direc
 - **Real-time monitoring** — uses OS-native file watchers (inotify / FSEvents / ReadDirectoryChangesW)
 - **Incremental sync** — only transfers changed files, with blake3 content hashing
 - **Large file support** — automatic chunked transfer for large files
-- **Conflict detection** — detects simultaneous modifications and reports conflicts while preserving the local copy
+- **Conflict resolution** — detects simultaneous modifications; `--conflict last-write-wins` uses timestamps to pick the winner, `--conflict keep-both` preserves both versions
 - **Event debouncing** — merges rapid filesystem events within a configurable window
 - **Heartbeat** — monitors peer liveness with periodic heartbeat events
 - **Graceful shutdown** — handles Ctrl+C cleanly, no leaked shared memory segments
@@ -79,7 +79,7 @@ dirsync host -i ./work-a --conflict keep-both
 dirsync join -i ./work-b --conflict keep-both
 ```
 
-> Note: the current release detects conflicts and preserves the local copy. Full automatic `last-write-wins` / `keep-both` resolution is reserved for a follow-up.
+The `last-write-wins` strategy compares the remote event timestamp with the local file's modification time — the newer side wins. The `keep-both` strategy renames the local copy to `<name>.local.<ext>` and accepts the remote version.
 
 ## Architecture
 

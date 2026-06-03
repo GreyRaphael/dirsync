@@ -126,8 +126,8 @@ impl Cli {
 
 #[derive(clap::ValueEnum, Clone, Debug, PartialEq)]
 pub enum ConflictStrategy {
-    /// Reserved for last-write-wins conflict resolution.
+    /// Accept remote changes when the remote timestamp is newer; otherwise preserve the local copy.
     LastWriteWins,
-    /// Reserved for keep-both conflict resolution.
+    /// On conflict, rename the local copy to `<name>.local.<ext>` and accept the remote version.
     KeepBoth,
 }

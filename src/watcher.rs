@@ -444,32 +444,48 @@ pub fn hash_data(data: &[u8]) -> ([u8; 32], u64) {
 }
 
 /// Read a file and compute its blake3 hash and size.
-/// Retries up to 3 times with 100ms delay on failure (handles transient locks).
+/// Uses a streaming 1 MB buffer so memory stays constant regardless of file
+/// size.  Retries up to 3 times with 100 ms delay on transient failures.
 pub fn file_hash_and_size(path: &Path) -> Result<([u8; 32], u64)> {
-    let data = read_with_retry(path, 3, Duration::from_millis(100))?;
-    Ok(hash_data(&data))
-}
-
-/// Read a file with retry logic for transient failures (file locked, etc.).
-fn read_with_retry(path: &Path, max_retries: u32, delay: Duration) -> Result<Vec<u8>> {
-    let mut last_err: Option<std::io::Error> = None;
-    for attempt in 0..=max_retries {
-        match fs::read(path) {
-            Ok(data) => return Ok(data),
+    let mut last_err: Option<anyhow::Error> = None;
+    for attempt in 0..=3u32 {
+        match streaming_hash_inner(path) {
+            Ok(v) => return Ok(v),
             Err(e) => {
                 last_err = Some(e);
-                if attempt < max_retries {
-                    std::thread::sleep(delay);
+                if attempt < 3 {
+                    std::thread::sleep(Duration::from_millis(100));
                 }
             }
         }
     }
     anyhow::bail!(
-        "Failed to read {} after {} retries: {}",
+        "Failed to hash {} after 3 retries: {}",
         path.display(),
-        max_retries,
         last_err.unwrap()
     )
+}
+
+/// Streaming inner implementation: hash a file by reading it in 1 MB chunks so
+/// that memory usage stays constant regardless of file size.
+fn streaming_hash_inner(path: &Path) -> Result<([u8; 32], u64)> {
+    use std::io::Read;
+    let mut file =
+        fs::File::open(path).with_context(|| format!("Failed to open {}", path.display()))?;
+    let mut hasher = Hasher::new();
+    let mut size = 0u64;
+    let mut buf = vec![0u8; 1024 * 1024];
+    loop {
+        let n = file
+            .read(&mut buf)
+            .with_context(|| format!("Failed to read {}", path.display()))?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+        size += n as u64;
+    }
+    Ok((*hasher.finalize().as_bytes(), size))
 }
 
 /// Wait until a file has stopped changing for a sustained quiet period.
@@ -535,15 +551,7 @@ pub fn wait_for_stable(path: &Path, interval: Duration, max_wait: Duration) -> R
     }
 }
 
-/// Read a file that has been confirmed stable, returning (data, hash, size).
-///
-/// This is the single-read entry point: the caller gets the raw bytes,
-/// the blake3 hash, and the size — all from one read, no TOCTOU.
-pub fn read_and_hash(path: &Path) -> Result<(Vec<u8>, [u8; 32], u64)> {
-    let data = fs::read(path).with_context(|| format!("Failed to read {}", path.display()))?;
-    let (hash, size) = hash_data(&data);
-    Ok((data, hash, size))
-}
+
 
 /// Perform initial full scan of a directory, returning SyncEvents for all contents.
 pub fn initial_scan(root: &Path, ignore_dirs: &[String]) -> Vec<SyncEvent> {

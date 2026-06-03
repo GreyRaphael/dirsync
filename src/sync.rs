@@ -12,19 +12,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 
-/// Interval between heartbeat events.
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
-
-/// Time without a remote heartbeat before declaring the peer offline.
 const PEER_TIMEOUT: Duration = Duration::from_secs(15);
-
-/// How long to wait for a file's size to stabilize before reading it.
 const STABILITY_INTERVAL: Duration = Duration::from_millis(200);
 const STABILITY_MAX_WAIT: Duration = Duration::from_secs(30);
 const REMOTE_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const MIN_CHUNK_SIZE: usize = 16 * 1024;
 
-/// The sync engine ties together the watcher, shared memory transport, and change applier.
 pub struct SyncEngine {
     instance_id: u64,
     root: std::path::PathBuf,
@@ -34,20 +28,14 @@ pub struct SyncEngine {
     seq: u64,
     chunk_size: usize,
     ignore_dirs: Vec<String>,
-    /// Shared flag for graceful shutdown, set by signal handler.
     running: Arc<AtomicBool>,
-    /// Last time we received a heartbeat from the remote instance.
     last_remote_heartbeat: Instant,
-    /// Last time we sent our own heartbeat.
     last_heartbeat_sent: Instant,
-    /// Paths that were written by the applier in the previous iteration.
-    /// Events for these paths are suppressed in the next collection to
-    /// prevent the echo loop (remote write → local watcher → push back).
     suppressed_paths: HashSet<PathBuf>,
+    peer_offline: bool,
 }
 
 impl SyncEngine {
-    /// Create a new sync engine.
     pub fn new(instance_id: u64, cli: &Cli, running: Arc<AtomicBool>) -> Result<Self> {
         let root = cli
             .input()
@@ -80,10 +68,10 @@ impl SyncEngine {
             last_remote_heartbeat: now,
             last_heartbeat_sent: now,
             suppressed_paths: HashSet::new(),
+            peer_offline: false,
         })
     }
 
-    /// Push a single event to the SHM with metadata.
     fn push(&mut self, event: SyncEvent) -> Result<()> {
         self.seq += 1;
         let envelope = EventEnvelope {
@@ -103,11 +91,6 @@ impl SyncEngine {
         Ok(())
     }
 
-    /// For file-creating/modifying events, also push FileContent chunks.
-    ///
-    /// This is the critical path: we wait for the file to stabilize, read it
-    /// once, and use the same data for both the metadata hash and the content
-    /// chunks. This eliminates the TOCTOU between watcher hash and chunker read.
     fn push_with_content_and_drain(&mut self, event: SyncEvent) -> Result<()> {
         self.push_with_content_inner(event, true, true)
     }
@@ -142,10 +125,6 @@ impl SyncEngine {
         }
 
         if wait_for_stability {
-            // Wait for the file to finish being written (size stabilizes).
-            // Initial sync skips this path because the directory scan already
-            // works from existing files and a per-file quiet wait is too slow
-            // for large trees.
             match watcher::wait_for_stable(&abs_path, STABILITY_INTERVAL, STABILITY_MAX_WAIT) {
                 Ok(size) => {
                     debug!("File stabilized: {} ({} bytes)", rel_path.display(), size);
@@ -157,16 +136,15 @@ impl SyncEngine {
             }
         }
 
-        // Single read: data + hash from the same bytes, no TOCTOU
-        let (data, hash, size) = match watcher::read_and_hash(&abs_path) {
+        // First pass: compute hash and size by streaming (constant memory).
+        let (hash, size) = match watcher::file_hash_and_size(&abs_path) {
             Ok(v) => v,
             Err(e) => {
-                warn!("Failed to read {}: {}", rel_path.display(), e);
+                warn!("Failed to hash {}: {}", rel_path.display(), e);
                 return self.push_and_maybe_drain(event, drain_remote);
             }
         };
 
-        // Build the correct metadata event with the actual hash/size we just read
         let corrected_event = match &event {
             SyncEvent::FileCreated { path, .. } => SyncEvent::FileCreated {
                 path: path.clone(),
@@ -184,25 +162,40 @@ impl SyncEngine {
         self.push_and_maybe_drain(corrected_event.clone(), drain_remote)?;
         self.watcher.record_applied_event(&corrected_event);
 
-        for (index, chunk) in data.chunks(self.chunk_size).enumerate() {
+        // Second pass: stream file content in chunks (constant memory).
+        use std::io::Read;
+        let mut file = match std::fs::File::open(&abs_path) {
+            Ok(f) => f,
+            Err(e) => {
+                warn!("Failed to open {} for streaming: {}", rel_path.display(), e);
+                return Ok(());
+            }
+        };
+        let mut buf = vec![0u8; self.chunk_size];
+        let mut offset: u64 = 0;
+        loop {
+            let n = match file.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => n,
+                Err(e) => {
+                    warn!("Failed to read chunk from {}: {}", rel_path.display(), e);
+                    break;
+                }
+            };
             self.push_and_maybe_drain(
                 SyncEvent::FileContent {
                     path: rel_path.clone(),
-                    offset: (index * self.chunk_size) as u64,
-                    data: chunk.to_vec(),
+                    offset,
+                    data: buf[..n].to_vec(),
                 },
                 drain_remote,
             )?;
+            offset += n as u64;
         }
 
         Ok(())
     }
 
-    /// Wait until both instances are registered before the initial scan starts.
-    ///
-    /// Initial sync can produce much more data than the ring buffer can hold.
-    /// Starting only after the peer is present ensures there is a consumer to
-    /// advance the opposite read cursor.
     pub fn wait_for_peer(&self) -> Result<()> {
         let peer_bit = if self.instance_id == 0 { 0b10 } else { 0b01 };
         let mut last_log = Instant::now() - Duration::from_secs(5);
@@ -223,7 +216,6 @@ impl SyncEngine {
         anyhow::bail!("Shutdown requested before peer connected")
     }
 
-    /// Send a heartbeat if enough time has elapsed.
     fn maybe_send_heartbeat(&mut self) -> Result<()> {
         if self.last_heartbeat_sent.elapsed() >= HEARTBEAT_INTERVAL {
             let ts = chrono::Utc::now().timestamp_millis();
@@ -234,17 +226,21 @@ impl SyncEngine {
         Ok(())
     }
 
-    /// Check if the remote peer is still alive.
     fn check_peer_alive(&mut self) {
-        if self.last_remote_heartbeat.elapsed() > PEER_TIMEOUT {
+        let elapsed = self.last_remote_heartbeat.elapsed();
+        if elapsed > PEER_TIMEOUT && !self.peer_offline {
+            self.peer_offline = true;
+            let peer_id = 1 - self.instance_id;
             warn!(
-                "Peer offline: no heartbeat for {}s",
-                self.last_remote_heartbeat.elapsed().as_secs()
+                "Peer offline: no heartbeat for {}s — reclaiming peer SHM resources",
+                elapsed.as_secs()
             );
+            if let Err(e) = self.shm.force_unregister_peer(peer_id) {
+                warn!("Failed to reclaim peer resources: {}", e);
+            }
         }
     }
 
-    /// Run initial directory scan and push all entries to SHM.
     pub fn initial_sync(&mut self) -> Result<()> {
         info!("Performing initial sync for {}", self.root.display());
 
@@ -273,6 +269,10 @@ impl SyncEngine {
 
             if matches!(envelope.event, SyncEvent::Heartbeat { .. }) {
                 self.last_remote_heartbeat = Instant::now();
+                if self.peer_offline {
+                    info!("Peer back online");
+                    self.peer_offline = false;
+                }
                 debug!("Heartbeat received from instance {}", envelope.instance_id);
                 continue;
             }
@@ -281,7 +281,7 @@ impl SyncEngine {
                 self.suppressed_paths.insert(path.clone());
             }
 
-            match self.applier.apply_event(&envelope.event) {
+            match self.applier.apply_event(&envelope.event, envelope.timestamp) {
                 Ok(Some(conflict)) => {
                     info!(
                         "Conflict detected: {} (local={}B, remote={}B)",
@@ -308,7 +308,6 @@ impl SyncEngine {
         Ok(())
     }
 
-    /// Start watching for local changes and begin the sync loop.
     pub fn run_sync_loop(&mut self) -> Result<()> {
         self.watcher.seed_tracker(&self.root, &self.ignore_dirs);
         self.watcher.watch(&self.root)?;
@@ -320,16 +319,10 @@ impl SyncEngine {
         );
 
         while self.running.load(Ordering::Relaxed) {
-            // 1. Send heartbeat if needed
             self.maybe_send_heartbeat()?;
 
-            // 2. Drain remote events before waiting on local filesystem input.
-            // Large transfers can fill the ring buffer quickly; keeping the
-            // receiver cursor moving is more important than watcher latency.
             self.drain_remote_events()?;
 
-            // 3. Collect local filesystem events, suppressing paths that were
-            //    written by the applier in the previous iteration (echo prevention).
             let raw_events = self
                 .watcher
                 .collect_events_timeout(&self.root, REMOTE_POLL_INTERVAL);
@@ -343,7 +336,6 @@ impl SyncEngine {
                     _ => true,
                 })
                 .collect();
-            // Clear suppressed paths — they've been used for this iteration
             self.suppressed_paths.clear();
 
             if !local_events.is_empty() {
@@ -355,10 +347,8 @@ impl SyncEngine {
                 }
             }
 
-            // 4. Pop remote events from SHM
             self.drain_remote_events()?;
 
-            // 5. Check peer liveness
             self.check_peer_alive();
         }
 
@@ -449,12 +439,9 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let mut engine = make_engine(dir.path());
 
-        // Simulate: applier wrote to "foo.txt" last iteration
         engine.suppressed_paths.insert(PathBuf::from("foo.txt"));
         assert!(!engine.suppressed_paths.is_empty());
 
-        // After collecting (which filters suppressed paths), the set is cleared
-        // We can't easily test the full loop, but we can verify the mechanism
         engine.suppressed_paths.clear();
         assert!(engine.suppressed_paths.is_empty());
     }
