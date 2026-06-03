@@ -112,7 +112,7 @@ fn test_bidirectional_sync() {
 #[test]
 fn test_full_file_lifecycle() {
     let dir = TempDir::new().unwrap();
-    let applier = ChangeApplier::new(dir.path(), ConflictStrategy::LastWriteWins);
+    let mut applier = ChangeApplier::new(dir.path(), ConflictStrategy::LastWriteWins);
 
     // 1. Create directory
     applier
@@ -207,7 +207,7 @@ fn test_chunked_file_through_shm() {
     assert_eq!(events.len(), 4);
 
     let out_dir = TempDir::new().unwrap();
-    let applier = ChangeApplier::new(out_dir.path(), ConflictStrategy::LastWriteWins);
+    let mut applier = ChangeApplier::new(out_dir.path(), ConflictStrategy::LastWriteWins);
     let sync_events: Vec<SyncEvent> = events.into_iter().map(|e| e.event).collect();
     applier.apply_events(&sync_events).unwrap();
 
@@ -245,7 +245,7 @@ fn test_initial_scan_and_apply() {
 
     // Apply to destination
     let dst = TempDir::new().unwrap();
-    let applier = ChangeApplier::new(dst.path(), ConflictStrategy::LastWriteWins);
+    let mut applier = ChangeApplier::new(dst.path(), ConflictStrategy::LastWriteWins);
     applier.apply_events(&all_events).unwrap();
 
     // Verify structure and content
@@ -291,7 +291,7 @@ fn test_hash_consistency_across_operations() {
     let (hash1, size1) = file_hash_and_size(&file).unwrap();
 
     // Apply the same content via SyncEvent
-    let applier = ChangeApplier::new(dir.path(), ConflictStrategy::LastWriteWins);
+    let mut applier = ChangeApplier::new(dir.path(), ConflictStrategy::LastWriteWins);
     applier
         .apply_events(&[SyncEvent::FileContent {
             path: PathBuf::from("data.bin"),
@@ -330,10 +330,229 @@ fn test_large_file_chunked_transfer() {
 
     let events = shm.pop_events(1).unwrap();
     let out_dir = TempDir::new().unwrap();
-    let applier = ChangeApplier::new(out_dir.path(), ConflictStrategy::LastWriteWins);
+    let mut applier = ChangeApplier::new(out_dir.path(), ConflictStrategy::LastWriteWins);
     let sync_events: Vec<SyncEvent> = events.into_iter().map(|e| e.event).collect();
     applier.apply_events(&sync_events).unwrap();
 
     let out = fs::read(out_dir.path().join("large.bin")).unwrap();
     assert_eq!(out, content);
+}
+
+// ------------------------------------------------------------------
+// Conflict detection and resolution
+// ------------------------------------------------------------------
+
+#[test]
+fn test_conflict_last_write_wins_remote_overwrites() {
+    let dir = TempDir::new().unwrap();
+    let mut applier = ChangeApplier::new(dir.path(), ConflictStrategy::LastWriteWins);
+
+    // Initial sync: remote creates file and delivers content
+    applier
+        .apply_events(&[
+            SyncEvent::FileCreated {
+                path: PathBuf::from("shared.txt"),
+                content_hash: [0xAA; 32],
+                size: 13,
+            },
+            SyncEvent::FileContent {
+                path: PathBuf::from("shared.txt"),
+                offset: 0,
+                data: b"remote version".to_vec(),
+            },
+        ])
+        .unwrap();
+
+    // Write local content (simulating local edit)
+    fs::write(dir.path().join("shared.txt"), b"local version").unwrap();
+
+    // Remote sends a modification with different hash
+    let hash_b = [0xBB; 32];
+    let conflicts = applier
+        .apply_events(&[SyncEvent::FileModified {
+            path: PathBuf::from("shared.txt"),
+            content_hash: hash_b,
+            size: 20,
+        }])
+        .unwrap();
+
+    // Conflict should be detected
+    assert_eq!(conflicts.len(), 1);
+    assert_eq!(conflicts[0].path, PathBuf::from("shared.txt"));
+    assert_eq!(conflicts[0].local_hash, file_hash_and_size(&dir.path().join("shared.txt")).unwrap().0);
+    assert_eq!(conflicts[0].remote_hash, hash_b);
+}
+
+#[test]
+fn test_conflict_keep_both_strategy() {
+    let dir = TempDir::new().unwrap();
+    let mut applier = ChangeApplier::new(dir.path(), ConflictStrategy::KeepBoth);
+
+    // Initial sync: create + content
+    applier
+        .apply_events(&[
+            SyncEvent::FileCreated {
+                path: PathBuf::from("doc.txt"),
+                content_hash: [0xAA; 32],
+                size: 10,
+            },
+            SyncEvent::FileContent {
+                path: PathBuf::from("doc.txt"),
+                offset: 0,
+                data: b"original  ".to_vec(),
+            },
+        ])
+        .unwrap();
+
+    // Local modification
+    fs::write(dir.path().join("doc.txt"), b"my changes").unwrap();
+
+    // Remote modification
+    let hash_b = [0xCC; 32];
+    let conflicts = applier
+        .apply_events(&[SyncEvent::FileModified {
+            path: PathBuf::from("doc.txt"),
+            content_hash: hash_b,
+            size: 15,
+        }])
+        .unwrap();
+
+    assert_eq!(conflicts.len(), 1);
+}
+
+#[test]
+fn test_no_conflict_same_content() {
+    let dir = TempDir::new().unwrap();
+    let mut applier = ChangeApplier::new(dir.path(), ConflictStrategy::LastWriteWins);
+
+    // Create file with known content
+    let content = b"identical content";
+    fs::write(dir.path().join("same.txt"), content).unwrap();
+    let (hash, size) = file_hash_and_size(&dir.path().join("same.txt")).unwrap();
+
+    // Remote creates with same hash — no conflict
+    let conflicts = applier
+        .apply_events(&[SyncEvent::FileCreated {
+            path: PathBuf::from("same.txt"),
+            content_hash: hash,
+            size,
+        }])
+        .unwrap();
+    assert!(conflicts.is_empty());
+}
+
+#[test]
+fn test_no_conflict_on_new_file() {
+    let dir = TempDir::new().unwrap();
+    let mut applier = ChangeApplier::new(dir.path(), ConflictStrategy::LastWriteWins);
+
+    // Remote creates a file that doesn't exist locally
+    let conflicts = applier
+        .apply_events(&[SyncEvent::FileCreated {
+            path: PathBuf::from("brand_new.txt"),
+            content_hash: [0xDD; 32],
+            size: 50,
+        }])
+        .unwrap();
+    assert!(conflicts.is_empty());
+    assert!(dir.path().join("brand_new.txt").exists());
+}
+
+#[test]
+fn test_conflict_on_second_modify() {
+    let dir = TempDir::new().unwrap();
+    let mut applier = ChangeApplier::new(dir.path(), ConflictStrategy::LastWriteWins);
+
+    // First sync: remote creates file and delivers content
+    applier
+        .apply_events(&[
+            SyncEvent::FileCreated {
+                path: PathBuf::from("evolving.txt"),
+                content_hash: [0x11; 32],
+                size: 11,
+            },
+            SyncEvent::FileContent {
+                path: PathBuf::from("evolving.txt"),
+                offset: 0,
+                data: b"version one".to_vec(),
+            },
+        ])
+        .unwrap();
+
+    // Second sync: remote modifies (local unchanged)
+    let conflicts = applier
+        .apply_events(&[SyncEvent::FileModified {
+            path: PathBuf::from("evolving.txt"),
+            content_hash: [0x22; 32],
+            size: 10,
+        }])
+        .unwrap();
+    // No conflict — local hasn't changed since last sync
+    assert!(conflicts.is_empty());
+
+    // Now local modifies the file
+    fs::write(dir.path().join("evolving.txt"), b"local edit here").unwrap();
+
+    // Third sync: remote modifies again with different content
+    let conflicts = applier
+        .apply_events(&[SyncEvent::FileModified {
+            path: PathBuf::from("evolving.txt"),
+            content_hash: [0x33; 32],
+            size: 15,
+        }])
+        .unwrap();
+    // Conflict! Both sides changed since last agreement
+    assert_eq!(conflicts.len(), 1);
+}
+
+#[test]
+fn test_full_sync_simulation_two_dirs() {
+    // Simulate two directories syncing through SHM
+    let dir_a = TempDir::new().unwrap();
+    let dir_b = TempDir::new().unwrap();
+
+    // Step 1: Create files in dir A
+    fs::write(dir_a.path().join("file_a.txt"), b"from A").unwrap();
+    fs::create_dir(dir_a.path().join("subdir")).unwrap();
+    fs::write(dir_a.path().join("subdir/nested.txt"), b"nested from A").unwrap();
+
+    // Step 2: Scan dir A
+    let events_a = initial_scan(dir_a.path(), &[]);
+    let mut all_a = events_a;
+    for entry in walkdir::WalkDir::new(dir_a.path()) {
+        let entry = entry.unwrap();
+        if entry.path().is_file() {
+            let rel = entry.path().strip_prefix(dir_a.path()).unwrap();
+            let chunks = chunker::chunk_file(rel, entry.path(), 65536).unwrap();
+            all_a.extend(chunks);
+        }
+    }
+
+    // Step 3: Apply to dir B
+    let mut applier_b = ChangeApplier::new(dir_b.path(), ConflictStrategy::LastWriteWins);
+    let conflicts = applier_b.apply_events(&all_a).unwrap();
+    assert!(conflicts.is_empty());
+
+    // Step 4: Verify dir B matches dir A
+    assert_eq!(
+        fs::read(dir_b.path().join("file_a.txt")).unwrap(),
+        b"from A"
+    );
+    assert!(dir_b.path().join("subdir").is_dir());
+    assert_eq!(
+        fs::read(dir_b.path().join("subdir/nested.txt")).unwrap(),
+        b"nested from A"
+    );
+
+    // Step 5: Modify in dir B, scan and sync back to dir A
+    fs::write(dir_b.path().join("file_a.txt"), b"modified by B").unwrap();
+    fs::write(dir_b.path().join("new_in_b.txt"), b"new from B").unwrap();
+
+    let events_b = initial_scan(dir_b.path(), &[]);
+    // Filter to only new/modified (in real usage, the watcher handles this)
+    let mut applier_a = ChangeApplier::new(dir_a.path(), ConflictStrategy::LastWriteWins);
+    let _conflicts = applier_a.apply_events(&events_b).unwrap();
+
+    // new_in_b.txt should exist in dir A now
+    assert!(dir_a.path().join("new_in_b.txt").exists());
 }

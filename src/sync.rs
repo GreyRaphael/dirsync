@@ -141,8 +141,20 @@ impl SyncEngine {
 
             if !remote_events.is_empty() {
                 debug!("Applying {} remote events", remote_events.len());
-                if let Err(e) = self.applier.apply_events(&remote_events) {
-                    warn!("Failed to apply remote events: {}", e);
+                match self.applier.apply_events(&remote_events) {
+                    Ok(conflicts) => {
+                        for c in &conflicts {
+                            info!(
+                                "Conflict detected: {} (local={}B, remote={}B)",
+                                c.path.display(),
+                                c.local_size,
+                                c.remote_size
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        warn!("Failed to apply remote events: {}", e);
+                    }
                 }
             }
 
