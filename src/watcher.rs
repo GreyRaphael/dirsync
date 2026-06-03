@@ -117,6 +117,82 @@ impl FsWatcher {
         Ok(())
     }
 
+    /// Collect events with a timeout. Returns empty if no events arrive within
+    /// the timeout period. Used in the sync loop to allow periodic heartbeat
+    /// checks without blocking indefinitely.
+    pub fn collect_events_timeout(&mut self, root: &Path, timeout: Duration) -> Vec<SyncEvent> {
+        let first = match self.event_rx.recv_timeout(timeout) {
+            Ok(Ok(event)) => event,
+            Ok(Err(e)) => {
+                warn!("Watch error: {}", e);
+                return Vec::new();
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => return Vec::new(),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return Vec::new(),
+        };
+
+        let mut by_path: HashMap<PathBuf, SyncEvent> = HashMap::new();
+        if let Some(sync_events) = self.translate_event(root, &first) {
+            for e in sync_events {
+                if let Some(p) = e.path().cloned() {
+                    by_path.insert(p, e);
+                }
+            }
+        }
+
+        // Debounce: wait, then drain remaining
+        std::thread::sleep(self.debounce);
+        while let Ok(Ok(event)) = self.event_rx.try_recv() {
+            if let Some(sync_events) = self.translate_event(root, &event) {
+                for e in sync_events {
+                    if let Some(p) = e.path().cloned() {
+                        by_path.insert(p, e);
+                    }
+                }
+            }
+        }
+
+        by_path.into_values().filter(|e| self.should_emit_filter(e)).collect()
+    }
+
+    fn should_emit_filter(&mut self, event: &SyncEvent) -> bool {
+        match event {
+            SyncEvent::FileCreated {
+                path,
+                content_hash,
+                size,
+            } => {
+                let (known, changed) = self.tracker.check(path, content_hash, size);
+                if known && !changed {
+                    return false;
+                }
+                self.tracker.record(path.clone(), *content_hash, *size);
+                true
+            }
+            SyncEvent::FileModified {
+                path,
+                content_hash,
+                size,
+            } => {
+                let (known, changed) = self.tracker.check(path, content_hash, size);
+                if known && !changed {
+                    return false;
+                }
+                self.tracker.record(path.clone(), *content_hash, *size);
+                true
+            }
+            SyncEvent::FileDeleted { path } => {
+                self.tracker.remove(path);
+                true
+            }
+            SyncEvent::DirDeleted { path } => {
+                self.tracker.states.retain(|p, _| !p.starts_with(path));
+                true
+            }
+            _ => true,
+        }
+    }
+
     /// Block until at least one event arrives, then collect with debounce.
     ///
     /// Events for the same path within the debounce window are merged:

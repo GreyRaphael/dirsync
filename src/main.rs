@@ -3,6 +3,8 @@ use clap::Parser;
 use dirsync::cli::Cli;
 use dirsync::shm::ShmTransport;
 use dirsync::sync::SyncEngine;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
@@ -34,6 +36,17 @@ fn main() -> Result<()> {
         anyhow::bail!("Input path is not a directory: {}", cli.input.display());
     }
 
+    // Shared flag for graceful shutdown
+    let running = Arc::new(AtomicBool::new(true));
+
+    // Register Ctrl+C handler
+    let r = running.clone();
+    ctrlc::set_handler(move || {
+        info!("Shutdown signal received, stopping...");
+        r.store(false, Ordering::Relaxed);
+    })
+    .expect("Error setting Ctrl-C handler");
+
     // Determine instance ID based on which process connects first
     // Instance 0 = first to create SHM, Instance 1 = second to open
     let instance_id = if ShmTransport::open(&cli.shm_name).is_err() {
@@ -45,13 +58,14 @@ fn main() -> Result<()> {
     info!("Assigned instance_id: {}", instance_id);
 
     // Create sync engine
-    let mut engine = SyncEngine::new(instance_id, &cli)?;
+    let mut engine = SyncEngine::new(instance_id, &cli, running)?;
 
     // Perform initial sync
     engine.initial_sync()?;
 
-    // Run the sync loop (blocks forever)
+    // Run the sync loop (blocks until shutdown signal)
     engine.run_sync_loop()?;
 
+    info!("dirsync stopped");
     Ok(())
 }
