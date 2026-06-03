@@ -2,20 +2,60 @@ use crate::event::SyncEvent;
 use anyhow::{Context, Result};
 use blake3::Hasher;
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver};
 use std::time::Duration;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 use walkdir::WalkDir;
+
+/// Cached state for a single file.
+#[derive(Debug, Clone)]
+struct FileState {
+    hash: [u8; 32],
+    size: u64,
+}
+
+/// Tracks known file hashes to detect true create vs modify.
+struct FileStateTracker {
+    states: HashMap<PathBuf, FileState>,
+}
+
+impl FileStateTracker {
+    fn new() -> Self {
+        Self {
+            states: HashMap::new(),
+        }
+    }
+
+    /// Record a file's state after a successful sync event.
+    fn record(&mut self, path: PathBuf, hash: [u8; 32], size: u64) {
+        self.states.insert(path, FileState { hash, size });
+    }
+
+    /// Remove a file's tracked state.
+    fn remove(&mut self, path: &Path) {
+        self.states.remove(path);
+    }
+
+    /// Check if a file is known and whether its content has changed.
+    /// Returns: (is_known, has_changed)
+    fn check(&self, path: &Path, hash: &[u8; 32], size: &u64) -> (bool, bool) {
+        match self.states.get(path) {
+            Some(state) => (true, state.hash != *hash || state.size != *size),
+            None => (false, false),
+        }
+    }
+}
 
 /// File system watcher that emits SyncEvents for local changes.
 pub struct FsWatcher {
     watcher: RecommendedWatcher,
     event_rx: Receiver<notify::Result<Event>>,
-    ignore_dirs: HashSet<PathBuf>,
+    ignore_dirs: Vec<PathBuf>,
     debounce: Duration,
+    tracker: FileStateTracker,
 }
 
 impl FsWatcher {
@@ -31,17 +71,41 @@ impl FsWatcher {
         )
         .context("Failed to create file watcher")?;
 
-        let ignore_set: HashSet<PathBuf> = ignore_dirs
-            .iter()
-            .map(|d| root.join(d))
-            .collect();
+        let ignore_set: Vec<PathBuf> = ignore_dirs.iter().map(|d| root.join(d)).collect();
 
         Ok(Self {
             watcher,
             event_rx: rx,
             ignore_dirs: ignore_set,
             debounce,
+            tracker: FileStateTracker::new(),
         })
+    }
+
+    /// Seed the tracker with the current state of all files in `root`.
+    /// Call this after `initial_sync` so that subsequent events are
+    /// correctly classified as create vs modify.
+    pub fn seed_tracker(&mut self, root: &Path, ignore_dirs: &[String]) {
+        for entry in WalkDir::new(root)
+            .into_iter()
+            .filter_entry(|e| {
+                let name = e.file_name().to_string_lossy();
+                !ignore_dirs.iter().any(|d| name.as_ref() == d.as_str())
+            })
+        {
+            let entry = match entry {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+            let path = entry.path();
+            if path.is_file()
+                && let Ok(rel) = path.strip_prefix(root)
+                && let Ok((hash, size)) = file_hash_and_size(path)
+            {
+                self.tracker.record(rel.to_path_buf(), hash, size);
+            }
+        }
+        info!("Seeded file tracker with {} entries", self.tracker.states.len());
     }
 
     /// Start watching the given directory.
@@ -53,74 +117,105 @@ impl FsWatcher {
         Ok(())
     }
 
-    /// Collect pending events with debounce.
+    /// Block until at least one event arrives, then collect with debounce.
     ///
-    /// Returns deduplicated events after waiting for the debounce window.
-    #[expect(dead_code)]
-    pub fn collect_events(&self, root: &Path) -> Vec<SyncEvent> {
-        let mut events = Vec::new();
-        let mut seen_paths = HashSet::new();
+    /// Events for the same path within the debounce window are merged:
+    /// only the latest event per path is kept.
+    pub fn collect_events_blocking(&mut self, root: &Path) -> Vec<SyncEvent> {
+        // Block for first event
+        let first = match self.event_rx.recv() {
+            Ok(Ok(event)) => event,
+            Ok(Err(e)) => {
+                warn!("Watch error: {}", e);
+                return Vec::new();
+            }
+            Err(_) => return Vec::new(),
+        };
 
-        // Drain all immediately available events
-        while let Ok(result) = self.event_rx.try_recv() {
-            match result {
-                Ok(event) => {
-                    if let Some(sync_events) = self.translate_event(root, &event) {
-                        for e in sync_events {
-                            let key = event_key(&e);
-                            if seen_paths.insert(key) {
-                                events.push(e);
-                            }
-                        }
-                    }
-                }
-                Err(e) => {
-                    warn!("Watch error: {}", e);
+        // Collect first event into a path-keyed map for dedup
+        let mut by_path: HashMap<PathBuf, SyncEvent> = HashMap::new();
+        if let Some(sync_events) = self.translate_event(root, &first) {
+            for e in sync_events {
+                if let Some(p) = e.path().cloned() {
+                    by_path.insert(p, e);
                 }
             }
         }
 
-        events
+        // Debounce: wait, then drain remaining events
+        std::thread::sleep(self.debounce);
+
+        while let Ok(Ok(event)) = self.event_rx.try_recv() {
+            if let Some(sync_events) = self.translate_event(root, &event) {
+                for e in sync_events {
+                    if let Some(p) = e.path().cloned() {
+                        by_path.insert(p, e);
+                    }
+                }
+            }
+        }
+
+        // Filter out events where the file hasn't actually changed
+        let mut result = Vec::new();
+        for (path, event) in by_path {
+            if self.should_emit(&path, &event) {
+                result.push(event);
+            }
+        }
+
+        result
     }
 
-    /// Block until at least one event arrives, then collect with debounce.
-    pub fn collect_events_blocking(&self, root: &Path) -> Vec<SyncEvent> {
-        // Block for first event
-        match self.event_rx.recv() {
-            Ok(Ok(event)) => {
-                let mut events = Vec::new();
-                let mut seen_paths = HashSet::new();
-
-                if let Some(sync_events) = self.translate_event(root, &event) {
-                    for e in sync_events {
-                        let key = event_key(&e);
-                        if seen_paths.insert(key) {
-                            events.push(e);
-                        }
-                    }
+    /// Check whether an event should be emitted based on tracked state.
+    fn should_emit(&mut self, _path: &Path, event: &SyncEvent) -> bool {
+        match event {
+            SyncEvent::FileCreated {
+                path,
+                content_hash,
+                size,
+            } => {
+                let (known, changed) = self.tracker.check(path, content_hash, size);
+                if known && !changed {
+                    // Already tracked and identical — skip
+                    debug!("Skipping unchanged file: {}", path.display());
+                    return false;
                 }
-
-                // Debounce: wait then drain remaining
-                std::thread::sleep(self.debounce);
-
-                while let Ok(Ok(event)) = self.event_rx.try_recv() {
-                    if let Some(sync_events) = self.translate_event(root, &event) {
-                        for e in sync_events {
-                            let key = event_key(&e);
-                            if seen_paths.insert(key) {
-                                events.push(e);
-                            }
-                        }
-                    }
+                if known && changed {
+                    // Was tracked but content differs — this is actually a modify
+                    // We still emit, but the sync engine will handle it
+                    self.tracker.record(path.clone(), *content_hash, *size);
+                    return true;
                 }
-
-                events
+                // New file
+                self.tracker.record(path.clone(), *content_hash, *size);
+                true
             }
-            Ok(Err(e)) => {
-                warn!("Watch error: {}", e);
-                Vec::new()
+            SyncEvent::FileModified {
+                path,
+                content_hash,
+                size,
+            } => {
+                let (known, changed) = self.tracker.check(path, content_hash, size);
+                if known && !changed {
+                    debug!("Skipping unchanged modify: {}", path.display());
+                    return false;
+                }
+                self.tracker.record(path.clone(), *content_hash, *size);
+                true
             }
-            Err(_) => Vec::new(),
+            SyncEvent::FileDeleted { path } => {
+                self.tracker.remove(path);
+                true
+            }
+            SyncEvent::DirCreated { .. } => true,
+            SyncEvent::DirDeleted { path } => {
+                // Remove all tracked files under this directory
+                self.tracker
+                    .states
+                    .retain(|p, _| !p.starts_with(path));
+                true
+            }
+            SyncEvent::FileContent { .. } | SyncEvent::Heartbeat { .. } => true,
         }
     }
 
@@ -139,8 +234,10 @@ impl FsWatcher {
                 for path in &event.paths {
                     let rel = path.strip_prefix(root).ok()?;
                     if path.is_dir() {
-                        result.push(SyncEvent::DirCreated { path: rel.to_path_buf() });
-                    } else {
+                        result.push(SyncEvent::DirCreated {
+                            path: rel.to_path_buf(),
+                        });
+                    } else if path.is_file() {
                         match file_hash_and_size(path) {
                             Ok((hash, size)) => {
                                 result.push(SyncEvent::FileCreated {
@@ -176,7 +273,11 @@ impl FsWatcher {
                         }
                     }
                 }
-                if result.is_empty() { None } else { Some(result) }
+                if result.is_empty() {
+                    None
+                } else {
+                    Some(result)
+                }
             }
             EventKind::Remove(_) => {
                 let mut result = Vec::new();
@@ -184,9 +285,13 @@ impl FsWatcher {
                     let rel = path.strip_prefix(root).ok()?;
                     // Heuristic: if path has an extension, treat as file
                     if rel.extension().is_some() {
-                        result.push(SyncEvent::FileDeleted { path: rel.to_path_buf() });
+                        result.push(SyncEvent::FileDeleted {
+                            path: rel.to_path_buf(),
+                        });
                     } else {
-                        result.push(SyncEvent::DirDeleted { path: rel.to_path_buf() });
+                        result.push(SyncEvent::DirDeleted {
+                            path: rel.to_path_buf(),
+                        });
                     }
                 }
                 Some(result)
@@ -196,12 +301,7 @@ impl FsWatcher {
     }
 
     fn is_ignored(&self, path: &Path) -> bool {
-        for ignore in &self.ignore_dirs {
-            if path.starts_with(ignore) {
-                return true;
-            }
-        }
-        false
+        self.ignore_dirs.iter().any(|ignore| path.starts_with(ignore))
     }
 }
 
@@ -268,24 +368,52 @@ pub fn initial_scan(root: &Path, ignore_dirs: &[String]) -> Vec<SyncEvent> {
     events
 }
 
-/// Generate a deduplication key for a SyncEvent.
-fn event_key(event: &SyncEvent) -> String {
-    match event {
-        SyncEvent::FileCreated { path, .. } => format!("C:{}", path.display()),
-        SyncEvent::FileModified { path, .. } => format!("M:{}", path.display()),
-        SyncEvent::FileDeleted { path } => format!("D:{}", path.display()),
-        SyncEvent::DirCreated { path } => format!("DC:{}", path.display()),
-        SyncEvent::DirDeleted { path } => format!("DD:{}", path.display()),
-        SyncEvent::FileContent { path, offset, .. } => format!("FC:{}:{}", path.display(), offset),
-        SyncEvent::Heartbeat { .. } => "HB".to_string(),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::fs;
     use tempfile::TempDir;
+
+    // --- FileStateTracker tests ---
+
+    #[test]
+    fn test_tracker_new_file() {
+        let mut tracker = FileStateTracker::new();
+        let path = PathBuf::from("a.txt");
+        let hash = [1u8; 32];
+        let (known, _) = tracker.check(&path, &hash, &100);
+        assert!(!known);
+
+        tracker.record(path.clone(), hash, 100);
+        let (known, changed) = tracker.check(&path, &hash, &100);
+        assert!(known);
+        assert!(!changed);
+    }
+
+    #[test]
+    fn test_tracker_detects_change() {
+        let mut tracker = FileStateTracker::new();
+        let path = PathBuf::from("a.txt");
+        let hash1 = [1u8; 32];
+        let hash2 = [2u8; 32];
+
+        tracker.record(path.clone(), hash1, 100);
+        let (known, changed) = tracker.check(&path, &hash2, &200);
+        assert!(known);
+        assert!(changed);
+    }
+
+    #[test]
+    fn test_tracker_remove() {
+        let mut tracker = FileStateTracker::new();
+        let path = PathBuf::from("a.txt");
+        tracker.record(path.clone(), [0u8; 32], 50);
+        tracker.remove(&path);
+        let (known, _) = tracker.check(&path, &[0u8; 32], &50);
+        assert!(!known);
+    }
+
+    // --- initial_scan tests ---
 
     #[test]
     fn test_initial_scan_empty_dir() {
@@ -318,11 +446,14 @@ mod tests {
         fs::write(dir.path().join("sub/file.txt"), b"data").unwrap();
 
         let events = initial_scan(dir.path(), &[]);
-        // Should have: DirCreated("sub"), FileCreated("sub/file.txt")
         assert!(events.len() >= 2);
 
-        let has_dir = events.iter().any(|e| matches!(e, SyncEvent::DirCreated { path } if path == std::path::Path::new("sub")));
-        let has_file = events.iter().any(|e| matches!(e, SyncEvent::FileCreated { path, .. } if path == std::path::Path::new("sub/file.txt")));
+        let has_dir = events.iter().any(|e| {
+            matches!(e, SyncEvent::DirCreated { path } if path == Path::new("sub"))
+        });
+        let has_file = events.iter().any(|e| {
+            matches!(e, SyncEvent::FileCreated { path, .. } if path == Path::new("sub/file.txt"))
+        });
         assert!(has_dir, "Expected DirCreated for 'sub'");
         assert!(has_file, "Expected FileCreated for 'sub/file.txt'");
     }
@@ -335,13 +466,14 @@ mod tests {
         fs::write(dir.path().join("real.txt"), b"data").unwrap();
 
         let events = initial_scan(dir.path(), &[".git".to_string()]);
-        // Only real.txt should appear
         assert_eq!(events.len(), 1);
         assert!(matches!(
             &events[0],
-            SyncEvent::FileCreated { path, .. } if path == std::path::Path::new("real.txt")
+            SyncEvent::FileCreated { path, .. } if path == Path::new("real.txt")
         ));
     }
+
+    // --- file_hash_and_size tests ---
 
     #[test]
     fn test_file_hash_and_size() {
@@ -351,7 +483,6 @@ mod tests {
 
         let (hash, size) = file_hash_and_size(&file).unwrap();
         assert_eq!(size, 11);
-        // Hash should be deterministic
         let (hash2, _) = file_hash_and_size(&file).unwrap();
         assert_eq!(hash, hash2);
     }
@@ -367,27 +498,5 @@ mod tests {
         let (h1, _) = file_hash_and_size(&f1).unwrap();
         let (h2, _) = file_hash_and_size(&f2).unwrap();
         assert_ne!(h1, h2);
-    }
-
-    #[test]
-    fn test_event_key_dedup() {
-        let e1 = SyncEvent::FileCreated {
-            path: std::path::PathBuf::from("a.txt"),
-            content_hash: [0u8; 32],
-            size: 100,
-        };
-        let e2 = SyncEvent::FileModified {
-            path: std::path::PathBuf::from("a.txt"),
-            content_hash: [1u8; 32],
-            size: 200,
-        };
-        // Different event types for same path should have different keys
-        assert_ne!(event_key(&e1), event_key(&e2));
-    }
-
-    #[test]
-    fn test_event_key_heartbeat() {
-        let e = SyncEvent::Heartbeat { timestamp: 123 };
-        assert_eq!(event_key(&e), "HB");
     }
 }

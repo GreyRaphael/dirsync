@@ -1,14 +1,8 @@
-mod apply;
-mod chunker;
-mod cli;
-mod event;
-mod shm;
-mod sync;
-mod watcher;
-
 use anyhow::Result;
 use clap::Parser;
-use cli::Cli;
+use dirsync::cli::Cli;
+use dirsync::shm::ShmTransport;
+use dirsync::sync::SyncEngine;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
@@ -42,7 +36,7 @@ fn main() -> Result<()> {
 
     // Determine instance ID based on which process connects first
     // Instance 0 = first to create SHM, Instance 1 = second to open
-    let instance_id = if shm::ShmTransport::open(&cli.shm_name).is_err() {
+    let instance_id = if ShmTransport::open(&cli.shm_name).is_err() {
         0
     } else {
         1
@@ -51,7 +45,7 @@ fn main() -> Result<()> {
     info!("Assigned instance_id: {}", instance_id);
 
     // Create sync engine
-    let mut engine = sync::SyncEngine::new(instance_id, &cli)?;
+    let mut engine = SyncEngine::new(instance_id, &cli)?;
 
     // Perform initial sync
     engine.initial_sync()?;

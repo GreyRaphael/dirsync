@@ -8,7 +8,7 @@ use tracing::{debug, info};
 /// Apply received SyncEvents to the local directory.
 pub struct ChangeApplier {
     root: std::path::PathBuf,
-    #[expect(dead_code)]
+    #[allow(dead_code)]
     conflict_strategy: ConflictStrategy,
 }
 
@@ -120,7 +120,7 @@ impl ChangeApplier {
     }
 
     /// Resolve a conflict when both sides modified the same file.
-    #[expect(dead_code)]
+    #[allow(dead_code)]
     pub fn resolve_conflict(
         &self,
         _path: &Path,
@@ -152,7 +152,7 @@ impl ChangeApplier {
 }
 
 #[derive(Debug)]
-#[expect(dead_code)]
+#[allow(dead_code)]
 pub enum ConflictResolution {
     NoChange,
     KeepLocal,

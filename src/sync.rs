@@ -105,6 +105,8 @@ impl SyncEngine {
 
     /// Start watching for local changes and begin the sync loop.
     pub fn run_sync_loop(&mut self) -> Result<()> {
+        // Seed the file state tracker so we can distinguish create vs modify
+        self.watcher.seed_tracker(&self.root, &[]);
         self.watcher.watch(&self.root)?;
 
         info!(
