@@ -71,6 +71,9 @@ fn main() -> Result<()> {
     // Create sync engine
     let mut engine = SyncEngine::new(instance_id, &cli, running)?;
 
+    // Initial sync can exceed the ring buffer if the peer has not started yet.
+    engine.wait_for_peer()?;
+
     // Perform initial sync
     engine.initial_sync()?;
 

@@ -52,7 +52,8 @@ impl SyncEngine {
             .canonicalize()
             .unwrap_or_else(|_| cli.input.clone());
 
-        let shm = ShmTransport::create_or_open(&cli.shm_name, cli.shm_size)?;
+        let mut shm = ShmTransport::create_or_open(&cli.shm_name, cli.shm_size)?;
+        shm.register_instance(instance_id)?;
 
         let debounce = Duration::from_millis(cli.debounce_ms);
         let watcher = FsWatcher::new(&root, debounce, &cli.ignore)?;
@@ -89,39 +90,65 @@ impl SyncEngine {
         self.shm.push_event(self.instance_id, &envelope)
     }
 
+    fn push_and_maybe_drain(&mut self, event: SyncEvent, drain_remote: bool) -> Result<()> {
+        self.push(event)?;
+        if drain_remote {
+            self.drain_remote_events()?;
+        }
+        Ok(())
+    }
+
     /// For file-creating/modifying events, also push FileContent chunks.
     ///
     /// This is the critical path: we wait for the file to stabilize, read it
     /// once, and use the same data for both the metadata hash and the content
     /// chunks. This eliminates the TOCTOU between watcher hash and chunker read.
-    fn push_with_content(&mut self, event: SyncEvent) -> Result<()> {
+    fn push_with_content_and_drain(&mut self, event: SyncEvent) -> Result<()> {
+        self.push_with_content_inner(event, true, true)
+    }
+
+    fn push_initial_event(&mut self, event: SyncEvent) -> Result<()> {
+        self.push_with_content_inner(event, true, false)
+    }
+
+    fn push_with_content_inner(
+        &mut self,
+        event: SyncEvent,
+        drain_remote: bool,
+        wait_for_stability: bool,
+    ) -> Result<()> {
         let needs_content = matches!(
             event,
             SyncEvent::FileCreated { .. } | SyncEvent::FileModified { .. }
         );
 
         if !needs_content {
-            return self.push(event);
+            return self.push_and_maybe_drain(event, drain_remote);
         }
 
         let rel_path = match event.path() {
             Some(p) => p.clone(),
-            None => return self.push(event),
+            None => return self.push_and_maybe_drain(event, drain_remote),
         };
         let abs_path = self.root.join(&rel_path);
 
         if !abs_path.is_file() {
-            return self.push(event);
+            return self.push_and_maybe_drain(event, drain_remote);
         }
 
-        // Wait for the file to finish being written (size stabilizes)
-        match watcher::wait_for_stable(&abs_path, STABILITY_INTERVAL, STABILITY_MAX_WAIT) {
-            Ok(size) => {
-                debug!("File stabilized: {} ({} bytes)", rel_path.display(), size);
-            }
-            Err(e) => {
-                warn!("File did not stabilize: {}", e);
-                return self.push(event);
+        if wait_for_stability {
+            // Wait for the file to finish being written (size stabilizes).
+            // Initial sync skips this path because the directory scan already
+            // works from existing files and a per-file quiet wait is too slow
+            // for large trees.
+            match watcher::wait_for_stable(&abs_path, STABILITY_INTERVAL, STABILITY_MAX_WAIT) {
+                Ok(size) => {
+                    debug!("File stabilized: {} ({} bytes)", rel_path.display(), size);
+                }
+                Err(e) => {
+                    warn!("File did not stabilize: {}", e);
+                    return self.push_and_maybe_drain(event, drain_remote);
+                }
             }
         }
 
@@ -130,7 +157,7 @@ impl SyncEngine {
             Ok(v) => v,
             Err(e) => {
                 warn!("Failed to read {}: {}", rel_path.display(), e);
-                return self.push(event);
+                return self.push_and_maybe_drain(event, drain_remote);
             }
         };
 
@@ -149,15 +176,40 @@ impl SyncEngine {
             _ => event.clone(),
         };
 
-        self.push(corrected_event.clone())?;
+        self.push_and_maybe_drain(corrected_event.clone(), drain_remote)?;
         self.watcher.record_applied_event(&corrected_event);
 
         let chunks = chunker::chunk_data(&rel_path, &data, self.chunk_size);
         for chunk in chunks {
-            self.push(chunk)?;
+            self.push_and_maybe_drain(chunk, drain_remote)?;
         }
 
         Ok(())
+    }
+
+    /// Wait until both instances are registered before the initial scan starts.
+    ///
+    /// Initial sync can produce much more data than the ring buffer can hold.
+    /// Starting only after the peer is present ensures there is a consumer to
+    /// advance the opposite read cursor.
+    pub fn wait_for_peer(&self) -> Result<()> {
+        let peer_bit = if self.instance_id == 0 { 0b10 } else { 0b01 };
+        let mut last_log = Instant::now() - Duration::from_secs(5);
+
+        while self.running.load(Ordering::Relaxed) {
+            if self.shm.active_mask() & peer_bit != 0 {
+                info!("Peer connected");
+                return Ok(());
+            }
+
+            if last_log.elapsed() >= Duration::from_secs(5) {
+                info!("Waiting for peer instance before initial sync...");
+                last_log = Instant::now();
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+
+        anyhow::bail!("Shutdown requested before peer connected")
     }
 
     /// Send a heartbeat if enough time has elapsed.
@@ -188,10 +240,73 @@ impl SyncEngine {
         let events = watcher::initial_scan(&self.root, &self.ignore_dirs);
 
         for event in events {
-            self.push_with_content(event)?;
+            self.push_initial_event(event)?;
         }
 
         info!("Initial sync complete: {} events pushed", self.seq);
+        Ok(())
+    }
+
+    fn drain_remote_events(&mut self) -> Result<()> {
+        let remote_envelopes = self.shm.pop_events(self.instance_id)?;
+        self.handle_remote_events(&remote_envelopes)
+    }
+
+    fn handle_remote_events(&mut self, remote_envelopes: &[EventEnvelope]) -> Result<()> {
+        for envelope in remote_envelopes {
+            if envelope.instance_id != self.instance_id
+                && matches!(envelope.event, SyncEvent::Heartbeat { .. })
+            {
+                self.last_remote_heartbeat = Instant::now();
+                debug!("Heartbeat received from instance {}", envelope.instance_id);
+            }
+        }
+
+        let remote_events: Vec<SyncEvent> = remote_envelopes
+            .iter()
+            .filter(|e| e.instance_id != self.instance_id)
+            .filter(|e| !matches!(e.event, SyncEvent::Heartbeat { .. }))
+            .map(|e| e.event.clone())
+            .collect();
+
+        if remote_events.is_empty() {
+            return Ok(());
+        }
+
+        debug!("Applying {} remote events", remote_events.len());
+
+        // Record which paths the applier will write, so the watcher can
+        // suppress them on the next iteration (echo prevention).
+        for event in &remote_events {
+            if let Some(p) = event.path() {
+                self.suppressed_paths.insert(p.clone());
+            }
+        }
+
+        match self.applier.apply_events(&remote_events) {
+            Ok(conflicts) => {
+                let conflict_paths: HashSet<PathBuf> =
+                    conflicts.iter().map(|c| c.path.clone()).collect();
+                for c in &conflicts {
+                    info!(
+                        "Conflict detected: {} (local={}B, remote={}B)",
+                        c.path.display(),
+                        c.local_size,
+                        c.remote_size
+                    );
+                }
+                for event in &remote_events {
+                    match event.path() {
+                        Some(path) if conflict_paths.contains(path) => {}
+                        _ => self.watcher.record_applied_event(event),
+                    }
+                }
+            }
+            Err(e) => {
+                warn!("Failed to apply remote events: {}", e);
+            }
+        }
+
         Ok(())
     }
 
@@ -231,66 +346,14 @@ impl SyncEngine {
             if !local_events.is_empty() {
                 debug!("Collected {} local events", local_events.len());
                 for event in &local_events {
-                    if let Err(e) = self.push_with_content(event.clone()) {
+                    if let Err(e) = self.push_with_content_and_drain(event.clone()) {
                         warn!("Failed to push event to SHM: {}", e);
                     }
                 }
             }
 
             // 3. Pop remote events from SHM
-            let remote_envelopes = self.shm.pop_events(self.instance_id)?;
-
-            for envelope in &remote_envelopes {
-                if envelope.instance_id != self.instance_id
-                    && matches!(envelope.event, SyncEvent::Heartbeat { .. })
-                {
-                    self.last_remote_heartbeat = Instant::now();
-                    debug!("Heartbeat received from instance {}", envelope.instance_id);
-                }
-            }
-
-            let remote_events: Vec<SyncEvent> = remote_envelopes
-                .iter()
-                .filter(|e| e.instance_id != self.instance_id)
-                .filter(|e| !matches!(e.event, SyncEvent::Heartbeat { .. }))
-                .map(|e| e.event.clone())
-                .collect();
-
-            if !remote_events.is_empty() {
-                debug!("Applying {} remote events", remote_events.len());
-
-                // Record which paths the applier will write, so the watcher
-                // can suppress them on the next iteration (echo prevention).
-                for event in &remote_events {
-                    if let Some(p) = event.path() {
-                        self.suppressed_paths.insert(p.clone());
-                    }
-                }
-
-                match self.applier.apply_events(&remote_events) {
-                    Ok(conflicts) => {
-                        let conflict_paths: HashSet<PathBuf> =
-                            conflicts.iter().map(|c| c.path.clone()).collect();
-                        for c in &conflicts {
-                            info!(
-                                "Conflict detected: {} (local={}B, remote={}B)",
-                                c.path.display(),
-                                c.local_size,
-                                c.remote_size
-                            );
-                        }
-                        for event in &remote_events {
-                            match event.path() {
-                                Some(path) if conflict_paths.contains(path) => {}
-                                _ => self.watcher.record_applied_event(event),
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        warn!("Failed to apply remote events: {}", e);
-                    }
-                }
-            }
+            self.drain_remote_events()?;
 
             // 4. Check peer liveness
             self.check_peer_alive();

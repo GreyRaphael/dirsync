@@ -105,8 +105,8 @@ pub struct EventEnvelope {
 ///   0x24  u32      rb_read_a    ring buffer read cursor for A
 ///   0x28  u32      rb_read_b    ring buffer read cursor for B
 ///   0x2C  u32      rb_capacity  ring buffer capacity in bytes
-///   0x30  u32      dp_write     data pool write offset
-///   0x34  u32      dp_size      data pool total size
+///   0x30  u32      active_mask  bitmask of live instances
+///   0x34  u32      reserved     reserved for future protocol data
 #[repr(C)]
 #[derive(Clone)]
 pub struct ShmHeader {
@@ -120,8 +120,8 @@ pub struct ShmHeader {
     pub rb_read_a: u32,
     pub rb_read_b: u32,
     pub rb_capacity: u32,
-    pub dp_write: u32,
-    pub dp_size: u32,
+    pub active_mask: u32,
+    pub reserved: u32,
 }
 
 pub const SHM_MAGIC: &[u8; 4] = b"DSYN";
@@ -129,7 +129,7 @@ pub const SHM_VERSION: u32 = 1;
 pub const SHM_HEADER_SIZE: usize = 0x38;
 
 impl ShmHeader {
-    pub fn new(rb_capacity: u32, dp_size: u32) -> Self {
+    pub fn new(rb_capacity: u32, _reserved: u32) -> Self {
         Self {
             magic: *SHM_MAGIC,
             version: SHM_VERSION,
@@ -141,8 +141,8 @@ impl ShmHeader {
             rb_read_a: 0,
             rb_read_b: 0,
             rb_capacity,
-            dp_write: 0,
-            dp_size,
+            active_mask: 0,
+            reserved: 0,
         }
     }
 

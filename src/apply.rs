@@ -159,6 +159,7 @@ impl ChangeApplier {
         let mut file = fs::OpenOptions::new()
             .create(true)
             .write(true)
+            .truncate(false)
             .open(&pending.temp_path)
             .with_context(|| format!("Failed to open temp file: {}", pending.temp_path.display()))?;
         file.seek(SeekFrom::Start(offset))

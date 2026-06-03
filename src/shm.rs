@@ -20,6 +20,7 @@ const PUSH_RETRY_SLEEP: Duration = Duration::from_millis(10);
 pub struct ShmTransport {
     shmem: Shmem,
     shm_name: String,
+    registered_instance: Option<u64>,
     #[allow(dead_code)]
     total_size: usize,
 }
@@ -37,6 +38,7 @@ impl ShmTransport {
         let shm = Self {
             shmem,
             shm_name: name.to_string(),
+            registered_instance: None,
             total_size,
         };
 
@@ -61,6 +63,7 @@ impl ShmTransport {
         let shm = Self {
             shmem,
             shm_name: name.to_string(),
+            registered_instance: None,
             total_size,
         };
 
@@ -141,6 +144,67 @@ impl ShmTransport {
         lock.store(0, Ordering::Release);
     }
 
+    /// Mark an instance as active in the shared-memory header.
+    ///
+    /// The read cursor starts at the current write cursor so a restarted process
+    /// does not try to consume stale frames from before it joined. The initial
+    /// directory scan is responsible for reconciling state after startup.
+    pub fn register_instance(&mut self, instance_id: u64) -> Result<()> {
+        if instance_id > 1 {
+            anyhow::bail!("Invalid instance_id {}, expected 0 or 1", instance_id);
+        }
+
+        let lock = self
+            .try_acquire_lock(instance_id)
+            .ok_or_else(|| anyhow::anyhow!("Failed to acquire lock for register"))?;
+
+        let active_mask = {
+            let header_mut = unsafe { &mut *(self.base_ptr() as *mut ShmHeader) };
+            let bit = 1u32 << instance_id;
+            let write = header_mut.rb_write;
+            header_mut.active_mask |= bit;
+            if instance_id == 0 {
+                header_mut.rb_read_a = write;
+            } else {
+                header_mut.rb_read_b = write;
+            }
+            header_mut.active_mask
+        };
+
+        Self::release_lock(lock);
+        self.registered_instance = Some(instance_id);
+        debug!(
+            "Registered instance {} (active_mask={:#04b})",
+            instance_id, active_mask
+        );
+        Ok(())
+    }
+
+    /// Return the current active-instance bitmask.
+    pub fn active_mask(&self) -> u32 {
+        let header = unsafe { self.read_header() };
+        header.active_mask
+    }
+
+    fn unregister_instance(&mut self) {
+        let Some(instance_id) = self.registered_instance.take() else {
+            return;
+        };
+
+        let Some(lock) = self.try_acquire_lock(instance_id) else {
+            tracing::warn!("Failed to acquire lock while unregistering instance {}", instance_id);
+            return;
+        };
+
+        let header_mut = unsafe { &mut *(self.base_ptr() as *mut ShmHeader) };
+        header_mut.active_mask &= !(1u32 << instance_id);
+        Self::release_lock(lock);
+        debug!(
+            "Unregistered instance {} (active_mask={:#04b})",
+            instance_id, header_mut.active_mask
+        );
+    }
+
     /// Compute free bytes in the ring buffer.
     /// Must be called while holding the lock.
     fn free_bytes_locked(&self) -> u32 {
@@ -155,9 +219,17 @@ impl ShmTransport {
         let header = unsafe { self.read_header() };
         let cap = header.rb_capacity;
         let w = header.rb_write;
-        let used_a = used_between(header.rb_read_a, w, cap);
-        let used_b = used_between(header.rb_read_b, w, cap);
-        let used = std::cmp::max(used_a, used_b);
+        let active_mask = header.active_mask & 0b11;
+        let mut used = 0;
+
+        // If no instances have registered (unit tests and direct transport
+        // usage), preserve the original two-reader behavior.
+        if active_mask == 0 || active_mask & 0b01 != 0 {
+            used = used.max(used_between(header.rb_read_a, w, cap));
+        }
+        if active_mask == 0 || active_mask & 0b10 != 0 {
+            used = used.max(used_between(header.rb_read_b, w, cap));
+        }
 
         // Keep one byte empty so rb_read == rb_write always means empty.
         cap.saturating_sub(used).saturating_sub(1)
@@ -403,6 +475,7 @@ impl ShmTransport {
 
 impl Drop for ShmTransport {
     fn drop(&mut self) {
+        self.unregister_instance();
         debug!("Dropping SHM '{}'", self.shm_name);
     }
 }
