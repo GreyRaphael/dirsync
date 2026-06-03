@@ -1,7 +1,10 @@
 use crate::event::SyncEvent;
 use anyhow::{Context, Result};
 use blake3::Hasher;
-use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
+use notify::{
+    event::{ModifyKind, RemoveKind, RenameMode},
+    Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher,
+};
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -9,6 +12,9 @@ use std::sync::mpsc::{self, Receiver};
 use std::time::Duration;
 use tracing::{debug, info, warn};
 use walkdir::WalkDir;
+
+/// Internal workspace for assembling incoming files. It must never be synced.
+pub const INTERNAL_TEMP_DIR: &str = ".dirsync_tmp";
 
 /// Cached state for a single file.
 #[derive(Debug, Clone)]
@@ -37,6 +43,10 @@ impl FileStateTracker {
     /// Remove a file's tracked state.
     fn remove(&mut self, path: &Path) {
         self.states.remove(path);
+    }
+
+    fn is_known_file(&self, path: &Path) -> bool {
+        self.states.contains_key(path)
     }
 
     /// Check if a file is known and whether its content has changed.
@@ -71,7 +81,8 @@ impl FsWatcher {
         )
         .context("Failed to create file watcher")?;
 
-        let ignore_set: Vec<PathBuf> = ignore_dirs.iter().map(|d| root.join(d)).collect();
+        let mut ignore_set: Vec<PathBuf> = ignore_dirs.iter().map(|d| root.join(d)).collect();
+        ignore_set.push(root.join(INTERNAL_TEMP_DIR));
 
         Ok(Self {
             watcher,
@@ -90,7 +101,8 @@ impl FsWatcher {
             .into_iter()
             .filter_entry(|e| {
                 let name = e.file_name().to_string_lossy();
-                !ignore_dirs.iter().any(|d| name.as_ref() == d.as_str())
+                name.as_ref() != INTERNAL_TEMP_DIR
+                    && !ignore_dirs.iter().any(|d| name.as_ref() == d.as_str())
             })
         {
             let entry = match entry {
@@ -152,45 +164,7 @@ impl FsWatcher {
             }
         }
 
-        by_path.into_values().filter(|e| self.should_emit_filter(e)).collect()
-    }
-
-    fn should_emit_filter(&mut self, event: &SyncEvent) -> bool {
-        match event {
-            SyncEvent::FileCreated {
-                path,
-                content_hash,
-                size,
-            } => {
-                let (known, changed) = self.tracker.check(path, content_hash, size);
-                if known && !changed {
-                    return false;
-                }
-                self.tracker.record(path.clone(), *content_hash, *size);
-                true
-            }
-            SyncEvent::FileModified {
-                path,
-                content_hash,
-                size,
-            } => {
-                let (known, changed) = self.tracker.check(path, content_hash, size);
-                if known && !changed {
-                    return false;
-                }
-                self.tracker.record(path.clone(), *content_hash, *size);
-                true
-            }
-            SyncEvent::FileDeleted { path } => {
-                self.tracker.remove(path);
-                true
-            }
-            SyncEvent::DirDeleted { path } => {
-                self.tracker.states.retain(|p, _| !p.starts_with(path));
-                true
-            }
-            _ => true,
-        }
+        by_path.into_values().filter(|e| self.should_emit(e)).collect()
     }
 
     /// Block until at least one event arrives, then collect with debounce.
@@ -232,18 +206,38 @@ impl FsWatcher {
         }
 
         // Filter out events where the file hasn't actually changed
-        let mut result = Vec::new();
-        for (path, event) in by_path {
-            if self.should_emit(&path, &event) {
-                result.push(event);
-            }
-        }
+        by_path.into_values().filter(|e| self.should_emit(e)).collect()
+    }
 
-        result
+    /// Record a successfully applied remote event in the local tracker.
+    ///
+    /// Remote filesystem changes are suppressed to avoid echo loops, so they do
+    /// not pass through `should_emit`. Without this, later local deletes of
+    /// remote-created extensionless files could be misclassified as directories.
+    pub fn record_applied_event(&mut self, event: &SyncEvent) {
+        match event {
+            SyncEvent::FileCreated {
+                path,
+                content_hash,
+                size,
+            }
+            | SyncEvent::FileModified {
+                path,
+                content_hash,
+                size,
+            } => self.tracker.record(path.clone(), *content_hash, *size),
+            SyncEvent::FileDeleted { path } => self.tracker.remove(path),
+            SyncEvent::DirDeleted { path } => {
+                self.tracker.states.retain(|p, _| !p.starts_with(path));
+            }
+            SyncEvent::DirCreated { .. }
+            | SyncEvent::FileContent { .. }
+            | SyncEvent::Heartbeat { .. } => {}
+        }
     }
 
     /// Check whether an event should be emitted based on tracked state.
-    fn should_emit(&mut self, _path: &Path, event: &SyncEvent) -> bool {
+    fn should_emit(&mut self, event: &SyncEvent) -> bool {
         match event {
             SyncEvent::FileCreated {
                 path,
@@ -252,17 +246,8 @@ impl FsWatcher {
             } => {
                 let (known, changed) = self.tracker.check(path, content_hash, size);
                 if known && !changed {
-                    // Already tracked and identical — skip
-                    debug!("Skipping unchanged file: {}", path.display());
                     return false;
                 }
-                if known && changed {
-                    // Was tracked but content differs — this is actually a modify
-                    // We still emit, but the sync engine will handle it
-                    self.tracker.record(path.clone(), *content_hash, *size);
-                    return true;
-                }
-                // New file
                 self.tracker.record(path.clone(), *content_hash, *size);
                 true
             }
@@ -295,6 +280,62 @@ impl FsWatcher {
         }
     }
 
+    fn create_event(&self, root: &Path, path: &Path) -> Option<SyncEvent> {
+        let rel = path.strip_prefix(root).ok()?.to_path_buf();
+        if path.is_dir() {
+            return Some(SyncEvent::DirCreated { path: rel });
+        }
+
+        if path.is_file() {
+            match file_hash_and_size(path) {
+                Ok((hash, size)) => {
+                    return Some(SyncEvent::FileCreated {
+                        path: rel,
+                        content_hash: hash,
+                        size,
+                    });
+                }
+                Err(e) => warn!("Failed to hash {}: {}", path.display(), e),
+            }
+        }
+
+        None
+    }
+
+    fn modify_event(&self, root: &Path, path: &Path) -> Option<SyncEvent> {
+        if !path.is_file() {
+            return None;
+        }
+
+        let rel = path.strip_prefix(root).ok()?.to_path_buf();
+        match file_hash_and_size(path) {
+            Ok((hash, size)) => Some(SyncEvent::FileModified {
+                path: rel,
+                content_hash: hash,
+                size,
+            }),
+            Err(e) => {
+                warn!("Failed to hash {}: {}", path.display(), e);
+                None
+            }
+        }
+    }
+
+    fn remove_event(&self, root: &Path, path: &Path, kind: Option<&RemoveKind>) -> Option<SyncEvent> {
+        let rel = path.strip_prefix(root).ok()?.to_path_buf();
+        let is_file = match kind {
+            Some(RemoveKind::File) => true,
+            Some(RemoveKind::Folder) => false,
+            _ => self.tracker.is_known_file(&rel) || rel.extension().is_some(),
+        };
+
+        if is_file {
+            Some(SyncEvent::FileDeleted { path: rel })
+        } else {
+            Some(SyncEvent::DirDeleted { path: rel })
+        }
+    }
+
     /// Translate a notify event into our SyncEvent types.
     fn translate_event(&self, root: &Path, event: &Event) -> Option<Vec<SyncEvent>> {
         // Skip ignored directories
@@ -304,91 +345,192 @@ impl FsWatcher {
             }
         }
 
-        match event.kind {
+        let mut result = Vec::new();
+
+        match &event.kind {
             EventKind::Create(_) => {
-                let mut result = Vec::new();
                 for path in &event.paths {
-                    let rel = path.strip_prefix(root).ok()?;
-                    if path.is_dir() {
-                        result.push(SyncEvent::DirCreated {
-                            path: rel.to_path_buf(),
-                        });
-                    } else if path.is_file() {
-                        match file_hash_and_size(path) {
-                            Ok((hash, size)) => {
-                                result.push(SyncEvent::FileCreated {
-                                    path: rel.to_path_buf(),
-                                    content_hash: hash,
-                                    size,
-                                });
-                            }
-                            Err(e) => {
-                                warn!("Failed to hash {}: {}", path.display(), e);
-                            }
+                    if let Some(sync_event) = self.create_event(root, path) {
+                        result.push(sync_event);
+                    }
+                }
+            }
+            EventKind::Modify(ModifyKind::Name(mode)) => match mode {
+                RenameMode::From => {
+                    if let Some(path) = event.paths.first()
+                        && let Some(sync_event) = self.remove_event(root, path, None)
+                    {
+                        result.push(sync_event);
+                    }
+                }
+                RenameMode::To => {
+                    if let Some(path) = event.paths.last()
+                        && let Some(sync_event) = self.create_event(root, path)
+                    {
+                        result.push(sync_event);
+                    }
+                }
+                RenameMode::Both => {
+                    if let Some(path) = event.paths.first()
+                        && let Some(sync_event) = self.remove_event(root, path, None)
+                    {
+                        result.push(sync_event);
+                    }
+                    if let Some(path) = event.paths.get(1).or_else(|| event.paths.last())
+                        && let Some(sync_event) = self.create_event(root, path)
+                    {
+                        result.push(sync_event);
+                    }
+                }
+                RenameMode::Any | RenameMode::Other => {
+                    for path in &event.paths {
+                        if let Some(sync_event) = self.create_event(root, path) {
+                            result.push(sync_event);
+                        } else if let Some(sync_event) = self.remove_event(root, path, None) {
+                            result.push(sync_event);
                         }
                     }
                 }
-                Some(result)
-            }
+            },
             EventKind::Modify(_) => {
-                let mut result = Vec::new();
                 for path in &event.paths {
-                    if path.is_file() {
-                        let rel = path.strip_prefix(root).ok()?;
-                        match file_hash_and_size(path) {
-                            Ok((hash, size)) => {
-                                result.push(SyncEvent::FileModified {
-                                    path: rel.to_path_buf(),
-                                    content_hash: hash,
-                                    size,
-                                });
-                            }
-                            Err(e) => {
-                                warn!("Failed to hash {}: {}", path.display(), e);
-                            }
-                        }
+                    if let Some(sync_event) = self.modify_event(root, path) {
+                        result.push(sync_event);
                     }
                 }
-                if result.is_empty() {
-                    None
-                } else {
-                    Some(result)
-                }
             }
-            EventKind::Remove(_) => {
-                let mut result = Vec::new();
+            EventKind::Remove(kind) => {
                 for path in &event.paths {
-                    let rel = path.strip_prefix(root).ok()?;
-                    // Heuristic: if path has an extension, treat as file
-                    if rel.extension().is_some() {
-                        result.push(SyncEvent::FileDeleted {
-                            path: rel.to_path_buf(),
-                        });
-                    } else {
-                        result.push(SyncEvent::DirDeleted {
-                            path: rel.to_path_buf(),
-                        });
+                    if let Some(sync_event) = self.remove_event(root, path, Some(kind)) {
+                        result.push(sync_event);
                     }
                 }
-                Some(result)
             }
-            _ => None,
+            _ => {}
+        }
+
+        if result.is_empty() {
+            None
+        } else {
+            Some(result)
         }
     }
 
     fn is_ignored(&self, path: &Path) -> bool {
         self.ignore_dirs.iter().any(|ignore| path.starts_with(ignore))
+            || path.components().any(|c| c.as_os_str() == INTERNAL_TEMP_DIR)
     }
 }
 
-/// Compute blake3 hash and size of a file.
-pub fn file_hash_and_size(path: &Path) -> Result<([u8; 32], u64)> {
-    let data = fs::read(path).context("Failed to read file for hashing")?;
+/// Compute blake3 hash and size from already-read data.
+pub fn hash_data(data: &[u8]) -> ([u8; 32], u64) {
     let size = data.len() as u64;
     let mut hasher = Hasher::new();
-    hasher.update(&data);
-    let hash = hasher.finalize();
-    Ok((*hash.as_bytes(), size))
+    hasher.update(data);
+    (*hasher.finalize().as_bytes(), size)
+}
+
+/// Read a file and compute its blake3 hash and size.
+/// Retries up to 3 times with 100ms delay on failure (handles transient locks).
+pub fn file_hash_and_size(path: &Path) -> Result<([u8; 32], u64)> {
+    let data = read_with_retry(path, 3, Duration::from_millis(100))?;
+    Ok(hash_data(&data))
+}
+
+/// Read a file with retry logic for transient failures (file locked, etc.).
+fn read_with_retry(path: &Path, max_retries: u32, delay: Duration) -> Result<Vec<u8>> {
+    let mut last_err: Option<std::io::Error> = None;
+    for attempt in 0..=max_retries {
+        match fs::read(path) {
+            Ok(data) => return Ok(data),
+            Err(e) => {
+                last_err = Some(e);
+                if attempt < max_retries {
+                    std::thread::sleep(delay);
+                }
+            }
+        }
+    }
+    anyhow::bail!(
+        "Failed to read {} after {} retries: {}",
+        path.display(),
+        max_retries,
+        last_err.unwrap()
+    )
+}
+
+/// Wait until a file has stopped changing for a sustained quiet period.
+///
+/// This is critical for large files being copied — the watcher may detect
+/// creation/modification while the writer is still appending bytes. A single
+/// equal-size sample is not enough because large copies can briefly pause; we
+/// require both size and modification time to remain unchanged for multiple
+/// consecutive polls.
+///
+/// Returns the file size once stable, or an error if it never stabilizes.
+pub fn wait_for_stable(path: &Path, interval: Duration, max_wait: Duration) -> Result<u64> {
+    let initial = fs::metadata(path)
+        .with_context(|| format!("Failed to stat {}", path.display()))?;
+    let mut prev_size = initial.len();
+    let mut prev_modified = initial.modified().ok();
+    let mut quiet_for = Duration::ZERO;
+    let mut elapsed = Duration::ZERO;
+    let required_quiet = std::cmp::max(interval.saturating_mul(10), Duration::from_secs(2));
+
+    loop {
+        std::thread::sleep(interval);
+        elapsed += interval;
+
+        let metadata = match fs::metadata(path) {
+            Ok(m) => m,
+            Err(_) => {
+                // File disappeared or is temporarily unavailable — restart wait.
+                quiet_for = Duration::ZERO;
+                if elapsed >= max_wait {
+                    anyhow::bail!(
+                        "File {} did not stabilize within {}ms",
+                        path.display(),
+                        max_wait.as_millis()
+                    );
+                }
+                continue;
+            }
+        };
+
+        let cur_size = metadata.len();
+        let cur_modified = metadata.modified().ok();
+
+        if cur_size == prev_size && cur_modified == prev_modified {
+            quiet_for += interval;
+            if quiet_for >= required_quiet {
+                return Ok(cur_size);
+            }
+        } else {
+            prev_size = cur_size;
+            prev_modified = cur_modified;
+            quiet_for = Duration::ZERO;
+        }
+
+        if elapsed >= max_wait {
+            anyhow::bail!(
+                "File {} did not stabilize within {}ms (last size: {} bytes)",
+                path.display(),
+                max_wait.as_millis(),
+                cur_size
+            );
+        }
+    }
+}
+
+/// Read a file that has been confirmed stable, returning (data, hash, size).
+///
+/// This is the single-read entry point: the caller gets the raw bytes,
+/// the blake3 hash, and the size — all from one read, no TOCTOU.
+pub fn read_and_hash(path: &Path) -> Result<(Vec<u8>, [u8; 32], u64)> {
+    let data = fs::read(path)
+        .with_context(|| format!("Failed to read {}", path.display()))?;
+    let (hash, size) = hash_data(&data);
+    Ok((data, hash, size))
 }
 
 /// Perform initial full scan of a directory, returning SyncEvents for all contents.
@@ -399,7 +541,8 @@ pub fn initial_scan(root: &Path, ignore_dirs: &[String]) -> Vec<SyncEvent> {
         .into_iter()
         .filter_entry(|e| {
             let name = e.file_name().to_string_lossy();
-            !ignore_dirs.iter().any(|d| name.as_ref() == d.as_str())
+            name.as_ref() != INTERNAL_TEMP_DIR
+                && !ignore_dirs.iter().any(|d| name.as_ref() == d.as_str())
         })
     {
         match entry {
@@ -487,6 +630,24 @@ mod tests {
         tracker.remove(&path);
         let (known, _) = tracker.check(&path, &[0u8; 32], &50);
         assert!(!known);
+    }
+
+    #[test]
+    fn test_remove_extensionless_tracked_file() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("LICENSE");
+        fs::write(&path, b"license").unwrap();
+
+        let mut watcher = FsWatcher::new(dir.path(), Duration::from_millis(10), &[]).unwrap();
+        watcher.seed_tracker(dir.path(), &[]);
+        fs::remove_file(&path).unwrap();
+
+        let event = Event::new(EventKind::Remove(RemoveKind::Any)).add_path(path);
+        let events = watcher.translate_event(dir.path(), &event).unwrap();
+        assert!(matches!(
+            &events[0],
+            SyncEvent::FileDeleted { path } if path == Path::new("LICENSE")
+        ));
     }
 
     // --- initial_scan tests ---

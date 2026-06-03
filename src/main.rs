@@ -1,11 +1,10 @@
 use anyhow::Result;
 use clap::Parser;
 use dirsync::cli::Cli;
-use dirsync::shm::ShmTransport;
 use dirsync::sync::SyncEngine;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use tracing::info;
+use std::sync::atomic::{AtomicBool, Ordering};
+use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
 fn main() -> Result<()> {
@@ -24,9 +23,9 @@ fn main() -> Result<()> {
         .init();
 
     info!("dirsync starting");
-    info!("  Directory: {}", cli.input.display());
-    info!("  SHM name:  {}", cli.shm_name);
-    info!("  SHM size:  {} bytes", cli.shm_size);
+    info!("  Directory:  {}", cli.input.display());
+    info!("  SHM name:   {}", cli.shm_name);
+    info!("  SHM size:   {} bytes", cli.shm_size);
 
     // Ensure the input directory exists
     if !cli.input.exists() {
@@ -47,12 +46,23 @@ fn main() -> Result<()> {
     })
     .expect("Error setting Ctrl-C handler");
 
-    // Determine instance ID based on which process connects first
-    // Instance 0 = first to create SHM, Instance 1 = second to open
-    let instance_id = if ShmTransport::open(&cli.shm_name).is_err() {
-        0
-    } else {
-        1
+    // Determine instance ID: use explicit flag if provided, otherwise auto-detect
+    let instance_id = match cli.instance {
+        Some(id) => {
+            info!("Using explicit instance_id: {}", id);
+            id
+        }
+        None => {
+            warn!(
+                "--instance not specified, auto-detecting (may race if both start simultaneously)"
+            );
+            // Auto-detect: try to open existing SHM; if it fails, we're instance 0
+            if dirsync::shm::ShmTransport::open(&cli.shm_name).is_err() {
+                0
+            } else {
+                1
+            }
+        }
     };
 
     info!("Assigned instance_id: {}", instance_id);

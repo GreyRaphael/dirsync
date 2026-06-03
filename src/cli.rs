@@ -36,6 +36,10 @@ pub struct Cli {
     #[arg(long, default_value_t = 100)]
     pub debounce_ms: u64,
 
+    /// Instance ID (0 or 1). Must be different for each process in a sync pair.
+    #[arg(long, value_parser = clap::value_parser!(u64).range(0..=1))]
+    pub instance: Option<u64>,
+
     /// Directories to ignore (can be specified multiple times)
     #[arg(long)]
     pub ignore: Vec<String>,

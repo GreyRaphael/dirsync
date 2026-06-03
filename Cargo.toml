@@ -22,9 +22,6 @@ bincode = "1"
 # Hashing
 blake3 = "1"
 
-# Async runtime
-tokio = { version = "1", features = ["full"] }
-
 # Error handling & logging
 anyhow = "1"
 tracing = "0.1"

@@ -1,8 +1,8 @@
 use crate::cli::ConflictStrategy;
 use crate::event::SyncEvent;
-use crate::watcher::file_hash_and_size;
+use crate::watcher::{file_hash_and_size, INTERNAL_TEMP_DIR};
 use anyhow::{Context, Result};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use tracing::{debug, info, warn};
@@ -10,18 +10,26 @@ use tracing::{debug, info, warn};
 /// Cached state for conflict detection: path → (hash, size).
 type FileHashMap = HashMap<PathBuf, ([u8; 32], u64)>;
 
+struct PendingFileTransfer {
+    expected_hash: [u8; 32],
+    expected_size: u64,
+    temp_path: PathBuf,
+}
+
 /// Apply received SyncEvents to the local directory.
 pub struct ChangeApplier {
     root: PathBuf,
     #[allow(dead_code)]
     conflict_strategy: ConflictStrategy,
-    /// The hash of the file as last confirmed synced (content actually written).
-    /// Set when we receive FileContent at offset 0, meaning the file's content
-    /// is being delivered. Until then, we don't know the local file's "synced" state.
+    /// The hash of the file as last confirmed synced and committed to the final path.
+    /// Pending chunk transfers do not update this baseline until their expected
+    /// size and content hash have been verified.
     last_synced_hash: FileHashMap,
-    /// Set of files that we created from remote events but haven't received
-    /// content for yet. Used to avoid false conflict detection.
-    pending_remote_files: std::collections::HashSet<PathBuf>,
+    /// Files currently being assembled from remote chunks.
+    pending_remote_files: HashMap<PathBuf, PendingFileTransfer>,
+    /// Files whose metadata event was skipped due to a conflict; ignore their
+    /// following content chunks until a new metadata event starts a transfer.
+    blocked_remote_files: HashSet<PathBuf>,
 }
 
 impl ChangeApplier {
@@ -30,7 +38,8 @@ impl ChangeApplier {
             root: root.to_path_buf(),
             conflict_strategy,
             last_synced_hash: HashMap::new(),
-            pending_remote_files: std::collections::HashSet::new(),
+            pending_remote_files: HashMap::new(),
+            blocked_remote_files: HashSet::new(),
         }
     }
 
@@ -88,56 +97,208 @@ impl ChangeApplier {
         None
     }
 
+    fn temp_path_for(&self, path: &Path) -> PathBuf {
+        self.root.join(INTERNAL_TEMP_DIR).join(path)
+    }
+
+    fn prepare_transfer(
+        &mut self,
+        path: &Path,
+        expected_hash: [u8; 32],
+        expected_size: u64,
+    ) -> Result<()> {
+        self.blocked_remote_files.remove(path);
+        self.pending_remote_files.remove(path);
+
+        let full_path = self.root.join(path);
+        if let Some(parent) = full_path.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("Failed to create parent dir: {}", parent.display()))?;
+        }
+
+        if expected_size == 0 {
+            fs::write(&full_path, b"")
+                .with_context(|| format!("Failed to create empty file: {}", full_path.display()))?;
+            let (actual_hash, actual_size) = file_hash_and_size(&full_path)
+                .with_context(|| format!("Failed to hash empty file: {}", full_path.display()))?;
+            if actual_hash != expected_hash {
+                warn!("Committed empty file with mismatched metadata hash: {}", path.display());
+            }
+            self.last_synced_hash
+                .insert(path.to_path_buf(), (actual_hash, actual_size));
+            debug!("Committed empty file: {}", path.display());
+            return Ok(());
+        }
+
+        let temp_path = self.temp_path_for(path);
+        if let Some(parent) = temp_path.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("Failed to create temp parent dir: {}", parent.display()))?;
+        }
+        fs::File::create(&temp_path)
+            .with_context(|| format!("Failed to create temp file: {}", temp_path.display()))?;
+
+        self.pending_remote_files.insert(
+            path.to_path_buf(),
+            PendingFileTransfer {
+                expected_hash,
+                expected_size,
+                temp_path,
+            },
+        );
+        Ok(())
+    }
+
+    fn write_pending_chunk(&mut self, path: &Path, offset: u64, data: &[u8]) -> Result<()> {
+        let pending = match self.pending_remote_files.get(path) {
+            Some(p) => p,
+            None => return self.write_direct_chunk(path, offset, data),
+        };
+
+        use std::io::{Seek, SeekFrom, Write};
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .open(&pending.temp_path)
+            .with_context(|| format!("Failed to open temp file: {}", pending.temp_path.display()))?;
+        file.seek(SeekFrom::Start(offset))
+            .with_context(|| format!("Failed to seek temp file: {}", pending.temp_path.display()))?;
+        file.write_all(data)
+            .with_context(|| format!("Failed to write temp content: {}", pending.temp_path.display()))?;
+        file.flush()
+            .with_context(|| format!("Failed to flush temp content: {}", pending.temp_path.display()))?;
+
+        self.try_commit_transfer(path)
+    }
+
+    fn try_commit_transfer(&mut self, path: &Path) -> Result<()> {
+        let (expected_hash, expected_size, temp_path) = match self.pending_remote_files.get(path) {
+            Some(p) => (p.expected_hash, p.expected_size, p.temp_path.clone()),
+            None => return Ok(()),
+        };
+
+        let current_size = fs::metadata(&temp_path)
+            .with_context(|| format!("Failed to stat temp file: {}", temp_path.display()))?
+            .len();
+        if current_size < expected_size {
+            return Ok(());
+        }
+        if current_size > expected_size {
+            warn!(
+                "Received too much data for {} (expected={}B, temp={}B)",
+                path.display(),
+                expected_size,
+                current_size
+            );
+            return Ok(());
+        }
+
+        let (actual_hash, actual_size) = file_hash_and_size(&temp_path)
+            .with_context(|| format!("Failed to hash temp file: {}", temp_path.display()))?;
+        if actual_hash != expected_hash || actual_size != expected_size {
+            warn!(
+                "Waiting for complete data for {} (expected={}B, got={}B, hash_match={})",
+                path.display(),
+                expected_size,
+                actual_size,
+                actual_hash == expected_hash
+            );
+            return Ok(());
+        }
+
+        let full_path = self.root.join(path);
+        if let Some(parent) = full_path.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("Failed to create parent dir: {}", parent.display()))?;
+        }
+        if full_path.exists() {
+            fs::remove_file(&full_path)
+                .with_context(|| format!("Failed to replace existing file: {}", full_path.display()))?;
+        }
+        fs::rename(&temp_path, &full_path).with_context(|| {
+            format!(
+                "Failed to move temp file {} to {}",
+                temp_path.display(),
+                full_path.display()
+            )
+        })?;
+
+        self.pending_remote_files.remove(path);
+        self.last_synced_hash
+            .insert(path.to_path_buf(), (expected_hash, expected_size));
+        info!("Committed file: {} ({} bytes)", path.display(), expected_size);
+        Ok(())
+    }
+
+    fn write_direct_chunk(&mut self, path: &Path, offset: u64, data: &[u8]) -> Result<()> {
+        let full_path = self.root.join(path);
+        use std::io::{Seek, SeekFrom, Write};
+        if let Some(parent) = full_path.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("Failed to create parent dir: {}", parent.display()))?;
+        }
+
+        // Compatibility path for tests/older senders that provide content without
+        // a metadata event. Real transfers go through `pending_remote_files`.
+        let truncate = offset == 0;
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(truncate)
+            .open(&full_path)
+            .with_context(|| format!("Failed to open file for writing: {}", full_path.display()))?;
+        file.seek(SeekFrom::Start(offset))
+            .with_context(|| format!("Failed to seek: {}", full_path.display()))?;
+        file.write_all(data)
+            .with_context(|| format!("Failed to write content: {}", full_path.display()))?;
+
+        if let Ok((hash, size)) = file_hash_and_size(&full_path) {
+            self.last_synced_hash.insert(path.to_path_buf(), (hash, size));
+        }
+        Ok(())
+    }
+
     fn apply_single(&mut self, event: &SyncEvent) -> Result<Option<ConflictInfo>> {
         match event {
-            SyncEvent::FileCreated { path, content_hash: _, size: _ } => {
-                let full_path = self.root.join(path);
-
-                // Mark as pending — content will arrive via FileContent events
-                self.pending_remote_files.insert(path.clone());
-
-                if full_path.exists() {
-                    debug!("File already exists, skipping create: {}", path.display());
-                    return Ok(None);
-                }
-
-                if let Some(parent) = full_path.parent() {
-                    fs::create_dir_all(parent)
-                        .with_context(|| format!("Failed to create parent dir: {}", parent.display()))?;
-                }
-                fs::write(&full_path, "")
-                    .with_context(|| format!("Failed to create file: {}", full_path.display()))?;
-                info!("Created file: {}", path.display());
+            SyncEvent::FileCreated {
+                path,
+                content_hash,
+                size,
+            } => {
+                self.prepare_transfer(path, *content_hash, *size)?;
+                debug!("Prepared file create: {} ({} bytes)", path.display(), size);
                 Ok(None)
             }
 
-            SyncEvent::FileModified { path, content_hash, size } => {
-                let full_path = self.root.join(path);
-
+            SyncEvent::FileModified {
+                path,
+                content_hash,
+                size,
+            } => {
                 // Check for conflict: local changed since we last synced this file
                 if let Some(conflict) = self.detect_conflict(path, content_hash, *size) {
-                    warn!("Conflict on modify {} (local={}B, remote={}B)", path.display(), conflict.local_size, conflict.remote_size);
-                    self.pending_remote_files.insert(path.clone());
+                    warn!(
+                        "Conflict on modify {} (local={}B, remote={}B)",
+                        path.display(),
+                        conflict.local_size,
+                        conflict.remote_size
+                    );
+                    self.pending_remote_files.remove(path);
+                    self.blocked_remote_files.insert(path.clone());
                     return Ok(Some(conflict));
                 }
 
-                self.pending_remote_files.insert(path.clone());
-
-                if !full_path.exists() {
-                    debug!("File doesn't exist for modify, creating: {}", path.display());
-                    if let Some(parent) = full_path.parent() {
-                        fs::create_dir_all(parent)
-                            .with_context(|| format!("Failed to create parent dir: {}", parent.display()))?;
-                    }
-                    fs::write(&full_path, "")
-                        .with_context(|| format!("Failed to create file: {}", full_path.display()))?;
-                }
-                info!("Modified file: {}", path.display());
+                self.prepare_transfer(path, *content_hash, *size)?;
+                debug!("Prepared file modify: {} ({} bytes)", path.display(), size);
                 Ok(None)
             }
 
             SyncEvent::FileDeleted { path } => {
                 let full_path = self.root.join(path);
+                self.pending_remote_files.remove(path);
+                self.blocked_remote_files.remove(path);
+                let temp_path = self.temp_path_for(path);
+                let _ = fs::remove_file(temp_path);
                 self.last_synced_hash.remove(path);
                 if full_path.exists() {
                     fs::remove_file(&full_path)
@@ -162,6 +323,10 @@ impl ChangeApplier {
             SyncEvent::DirDeleted { path } => {
                 let full_path = self.root.join(path);
                 self.last_synced_hash.retain(|p, _| !p.starts_with(path));
+                self.pending_remote_files.retain(|p, _| !p.starts_with(path));
+                self.blocked_remote_files.retain(|p| !p.starts_with(path));
+                let temp_path = self.temp_path_for(path);
+                let _ = fs::remove_dir_all(temp_path);
                 if full_path.exists() {
                     fs::remove_dir_all(&full_path)
                         .with_context(|| format!("Failed to delete dir: {}", full_path.display()))?;
@@ -171,35 +336,13 @@ impl ChangeApplier {
             }
 
             SyncEvent::FileContent { path, offset, data } => {
-                let full_path = self.root.join(path);
-                use std::io::{Seek, SeekFrom, Write};
-                if let Some(parent) = full_path.parent() {
-                    fs::create_dir_all(parent)
-                        .with_context(|| format!("Failed to create parent dir: {}", parent.display()))?;
-                }
-                let mut file = fs::OpenOptions::new()
-                    .create(true)
-                    .write(true)
-                    .truncate(false)
-                    .open(&full_path)
-                    .with_context(|| format!("Failed to open file for writing: {}", full_path.display()))?;
-                file.seek(SeekFrom::Start(*offset))
-                    .with_context(|| format!("Failed to seek: {}", full_path.display()))?;
-                file.write_all(data)
-                    .with_context(|| format!("Failed to write content: {}", full_path.display()))?;
-
-                // Once content arrives at offset 0, the file is being written.
-                // Compute the hash as a baseline for future conflict detection.
-                // This may be a partial file (more chunks to come), but the hash
-                // will be updated on subsequent writes too.
-                if *offset == 0 {
-                    self.pending_remote_files.remove(path);
-                    if let Ok((hash, size)) = file_hash_and_size(&full_path) {
-                        self.last_synced_hash.insert(path.clone(), (hash, size));
-                    }
+                if self.blocked_remote_files.contains(path) {
+                    debug!("Ignoring content for conflicted file: {}", path.display());
+                    return Ok(None);
                 }
 
-                debug!("Wrote {} bytes at offset {} to {}", data.len(), offset, path.display());
+                self.write_pending_chunk(path, *offset, data)?;
+                debug!("Received {} bytes at offset {} for {}", data.len(), offset, path.display());
                 Ok(None)
             }
 
@@ -227,6 +370,10 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let applier = ChangeApplier::new(dir.path(), strategy);
         (dir, applier)
+    }
+
+    fn hash_size(data: &[u8]) -> ([u8; 32], u64) {
+        crate::watcher::hash_data(data)
     }
 
     #[test]
@@ -271,13 +418,12 @@ mod tests {
         let events = vec![SyncEvent::FileCreated {
             path: PathBuf::from("existing.txt"),
             content_hash: [1u8; 32],
-            size: 0,
+            size: 1,
         }];
         let conflicts = applier.apply_events(&events).unwrap();
-        // No conflict on first sync (no prior sync record) — file already exists,
-        // so the create is skipped but the hash is recorded for future conflict detection.
+        // No conflict on first sync, and existing content is preserved until
+        // the remote content chunks are complete and verified.
         assert!(conflicts.is_empty());
-        // Content is preserved
         assert_eq!(fs::read(dir.path().join("existing.txt")).unwrap(), b"original");
     }
 
@@ -333,6 +479,38 @@ mod tests {
     }
 
     #[test]
+    fn test_file_commits_only_after_complete_verified_chunks() {
+        let (dir, mut applier) = setup(ConflictStrategy::LastWriteWins);
+        let content = b"abcdefghij";
+        let (hash, size) = hash_size(content);
+
+        applier
+            .apply_events(&[
+                SyncEvent::FileCreated {
+                    path: PathBuf::from("large.bin"),
+                    content_hash: hash,
+                    size,
+                },
+                SyncEvent::FileContent {
+                    path: PathBuf::from("large.bin"),
+                    offset: 0,
+                    data: content[..5].to_vec(),
+                },
+            ])
+            .unwrap();
+        assert!(!dir.path().join("large.bin").exists());
+
+        applier
+            .apply_events(&[SyncEvent::FileContent {
+                path: PathBuf::from("large.bin"),
+                offset: 5,
+                data: content[5..].to_vec(),
+            }])
+            .unwrap();
+        assert_eq!(fs::read(dir.path().join("large.bin")).unwrap(), content);
+    }
+
+    #[test]
     fn test_nested_dir_created() {
         let (dir, mut applier) = setup(ConflictStrategy::LastWriteWins);
         let events = vec![SyncEvent::DirCreated {
@@ -352,19 +530,21 @@ mod tests {
     #[test]
     fn test_multiple_events_in_batch() {
         let (dir, mut applier) = setup(ConflictStrategy::LastWriteWins);
+        let content = b"# Hello";
+        let (hash, size) = hash_size(content);
         let events = vec![
             SyncEvent::DirCreated {
                 path: PathBuf::from("docs"),
             },
             SyncEvent::FileCreated {
                 path: PathBuf::from("docs/readme.md"),
-                content_hash: [0u8; 32],
-                size: 0,
+                content_hash: hash,
+                size,
             },
             SyncEvent::FileContent {
                 path: PathBuf::from("docs/readme.md"),
                 offset: 0,
-                data: b"# Hello".to_vec(),
+                data: content.to_vec(),
             },
         ];
         applier.apply_events(&events).unwrap();
@@ -391,16 +571,18 @@ mod tests {
         let (dir, mut applier) = setup(ConflictStrategy::LastWriteWins);
 
         // First sync: remote creates a file and delivers content
+        let remote_data = b"remote data";
+        let (remote_hash, remote_size) = hash_size(remote_data);
         applier.apply_events(&[
             SyncEvent::FileCreated {
                 path: PathBuf::from("shared.txt"),
-                content_hash: [0xAA; 32],
-                size: 10,
+                content_hash: remote_hash,
+                size: remote_size,
             },
             SyncEvent::FileContent {
                 path: PathBuf::from("shared.txt"),
                 offset: 0,
-                data: b"remote data".to_vec(),
+                data: remote_data.to_vec(),
             },
         ])
         .unwrap();

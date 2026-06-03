@@ -2,11 +2,19 @@ use crate::event::{EventEnvelope, ShmHeader, SHM_HEADER_SIZE};
 use anyhow::{Context, Result};
 use shared_memory::{Shmem, ShmemConf};
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::time::{Duration, Instant};
 use tracing::{debug, trace};
 
 /// Sentinel length value indicating a wrap-around padding in the ring buffer.
 /// When the reader encounters this value, it resets its cursor to offset 0.
 const WRAP_SENTINEL: u32 = 0xFFFFFFFF;
+
+/// Maximum spin iterations before declaring lock deadlock.
+const MAX_SPIN: u32 = 2_000_000;
+
+/// How long a producer waits for readers to free ring-buffer space.
+const PUSH_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
+const PUSH_RETRY_SLEEP: Duration = Duration::from_millis(10);
 
 /// Ring buffer based shared memory transport for SyncEvents.
 pub struct ShmTransport {
@@ -32,7 +40,6 @@ impl ShmTransport {
             total_size,
         };
 
-        // Initialize header
         let rb_capacity = (total_size - SHM_HEADER_SIZE) as u32;
         let header = ShmHeader::new(rb_capacity, 0);
         unsafe {
@@ -57,7 +64,6 @@ impl ShmTransport {
             total_size,
         };
 
-        // Validate header
         let header = unsafe { shm.read_header() };
         header.validate()?;
 
@@ -73,21 +79,16 @@ impl ShmTransport {
         }
     }
 
-    /// Get a pointer to the shared memory base.
     fn base_ptr(&self) -> *mut u8 {
         self.shmem.as_ptr()
     }
 
-    /// Read the header from shared memory.
-    ///
     /// # Safety
-    /// Caller must ensure no concurrent mutable access to the header region.
+    /// Caller must ensure the header region is not being concurrently mutated.
     unsafe fn read_header(&self) -> &ShmHeader {
         unsafe { &*(self.base_ptr() as *const ShmHeader) }
     }
 
-    /// Write header to shared memory.
-    ///
     /// # Safety
     /// Caller must ensure no concurrent access to the header region.
     unsafe fn write_header(&self, header: &ShmHeader) {
@@ -97,141 +98,191 @@ impl ShmTransport {
         }
     }
 
-    /// Get pointer to the ring buffer region (right after header).
     fn rb_ptr(&self) -> *mut u8 {
         unsafe { self.base_ptr().add(SHM_HEADER_SIZE) }
     }
 
-    /// Acquire the spinlock for the given instance.
-    ///
-    /// Returns a reference to the lock atomic so the caller can release it.
-    fn acquire_lock(&self, instance_id: u64) -> &'static AtomicU32 {
+    /// Get a pointer to the global ring-buffer lock.
+    fn lock_ptr(&self, _instance_id: u64) -> *const AtomicU32 {
         let header = self.base_ptr() as *const ShmHeader;
-        let lock_ptr = unsafe {
-            if instance_id == 0 {
-                &(*header).lock_a as *const u32
-            } else {
-                &(*header).lock_b as *const u32
-            }
-        };
-        let lock = unsafe { &*(lock_ptr as *const AtomicU32) };
-
-        while lock.compare_exchange_weak(0, 1, Ordering::Acquire, Ordering::Relaxed).is_err() {
-            std::hint::spin_loop();
-        }
-
-        lock
+        unsafe { &(*header).lock_a as *const u32 as *const AtomicU32 }
     }
 
-    /// Release a spinlock.
+    /// Acquire the spinlock with a timeout to prevent deadlock.
+    ///
+    /// Returns `Some(lock)` on success, `None` on timeout.
+    fn try_acquire_lock(&self, instance_id: u64) -> Option<&AtomicU32> {
+        let lock = unsafe { &*self.lock_ptr(instance_id) };
+        let mut spins = 0;
+        while lock
+            .compare_exchange_weak(0, 1, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            spins += 1;
+            if spins >= MAX_SPIN {
+                // Force-reclaim the lock: the holder likely crashed
+                lock.store(0, Ordering::Relaxed);
+                tracing::warn!("Lock timeout for instance {}, force-reclaimed", instance_id);
+                // Try once more
+                if lock
+                    .compare_exchange_weak(0, 1, Ordering::Acquire, Ordering::Relaxed)
+                    .is_ok()
+                {
+                    return Some(lock);
+                }
+                return None;
+            }
+            std::hint::spin_loop();
+        }
+        Some(lock)
+    }
+
     fn release_lock(lock: &AtomicU32) {
         lock.store(0, Ordering::Release);
     }
 
-    /// Compute how many free bytes remain in the ring buffer.
-    ///
-    /// The buffer is considered full when the next write would overlap the
-    /// slowest reader's cursor.
-    fn free_bytes(&self) -> u32 {
+    /// Compute free bytes in the ring buffer.
+    /// Must be called while holding the lock.
+    fn free_bytes_locked(&self) -> u32 {
+        fn used_between(read: u32, write: u32, cap: u32) -> u32 {
+            if write >= read {
+                write - read
+            } else {
+                cap - read + write
+            }
+        }
+
         let header = unsafe { self.read_header() };
         let cap = header.rb_capacity;
         let w = header.rb_write;
-        let r_a = header.rb_read_a;
-        let r_b = header.rb_read_b;
+        let used_a = used_between(header.rb_read_a, w, cap);
+        let used_b = used_between(header.rb_read_b, w, cap);
+        let used = std::cmp::max(used_a, used_b);
 
-        // Use the slowest (minimum) read cursor to compute free space
-        let slowest = std::cmp::min(r_a, r_b);
-
-        if w >= slowest {
-            cap - (w - slowest)
-        } else {
-            slowest - w
-        }
+        // Keep one byte empty so rb_read == rb_write always means empty.
+        cap.saturating_sub(used).saturating_sub(1)
     }
 
     /// Push an event envelope into the ring buffer.
     ///
     /// Frame layout: `[u32 len][bytes data]`
-    /// If the remaining space at the end is too small for the frame, a
-    /// WRAP_SENTINEL is written and the frame is placed at offset 0.
+    /// Wrap sentinel: `[u32 0xFFFFFFFF]` written at tail when not enough space.
     pub fn push_event(&self, instance_id: u64, envelope: &EventEnvelope) -> Result<()> {
         let encoded = bincode::serialize(envelope).context("Failed to serialize event")?;
         let data_len = encoded.len() as u32;
         let frame_len = 4 + data_len; // u32 prefix + data
+        let deadline = Instant::now() + PUSH_WAIT_TIMEOUT;
 
-        let lock = self.acquire_lock(instance_id);
+        loop {
+            let lock = self
+                .try_acquire_lock(instance_id)
+                .ok_or_else(|| anyhow::anyhow!("Failed to acquire lock"))?;
 
-        let header = unsafe { self.read_header() };
-        let cap = header.rb_capacity;
-        let w = header.rb_write;
+            let header = unsafe { self.read_header() };
+            let cap = header.rb_capacity;
+            let w = header.rb_write;
 
-        // Check if there is enough free space
-        let free = self.free_bytes();
-        if frame_len + 4 > free {
-            // +4 for potential wrap sentinel
-            Self::release_lock(lock);
-            anyhow::bail!(
-                "Ring buffer overflow: need {} bytes, {} free",
-                frame_len,
-                free
-            );
-        }
+            // Reject frames that can never fit. Reserve a few bytes for wrap
+            // sentinel/empty-space disambiguation.
+            if frame_len > cap.saturating_sub(4) {
+                Self::release_lock(lock);
+                anyhow::bail!("Event too large ({} bytes) for buffer ({} bytes)", frame_len, cap);
+            }
 
-        let rb = self.rb_ptr();
+            let tail_remaining = cap - w;
+            let would_leave_tiny_tail = w + frame_len < cap && cap - (w + frame_len) < 4;
+            let needs_wrap = w + frame_len > cap || would_leave_tiny_tail;
+            let required = if needs_wrap {
+                tail_remaining + frame_len
+            } else {
+                frame_len
+            };
+            let free = self.free_bytes_locked();
 
-        // Determine if we need to wrap
-        let actual_write = if w + frame_len > cap {
-            // Not enough room at the tail — write a wrap sentinel and start at 0
-            let sentinel = WRAP_SENTINEL.to_le_bytes();
+            if required > free {
+                Self::release_lock(lock);
+                if Instant::now() >= deadline {
+                    anyhow::bail!(
+                        "Ring buffer full for {}ms: need {} bytes, {} free",
+                        PUSH_WAIT_TIMEOUT.as_millis(),
+                        required,
+                        free
+                    );
+                }
+                std::thread::sleep(PUSH_RETRY_SLEEP);
+                continue;
+            }
+
+            let rb = self.rb_ptr();
+            let actual_write = if needs_wrap {
+                if w != 0 {
+                    if tail_remaining < 4 {
+                        Self::release_lock(lock);
+                        anyhow::bail!(
+                            "Ring buffer tail too small for wrap sentinel (w={}, cap={})",
+                            w,
+                            cap
+                        );
+                    }
+                    let sentinel = WRAP_SENTINEL.to_le_bytes();
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(sentinel.as_ptr(), rb.add(w as usize), 4);
+                    }
+                }
+                0u32
+            } else {
+                w
+            };
+
+            // Write frame: [u32 len][data]
             unsafe {
                 std::ptr::copy_nonoverlapping(
-                    sentinel.as_ptr(),
-                    rb.add(w as usize),
+                    data_len.to_le_bytes().as_ptr(),
+                    rb.add(actual_write as usize),
                     4,
                 );
+                std::ptr::copy_nonoverlapping(
+                    encoded.as_ptr(),
+                    rb.add(actual_write as usize + 4),
+                    data_len as usize,
+                );
             }
-            0u32
-        } else {
-            w
-        };
 
-        // Write frame: [u32 len][data]
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                data_len.to_le_bytes().as_ptr(),
-                rb.add(actual_write as usize),
-                4,
+            // Update header atomically: rb_write first (data is visible), then seq.
+            // The reader checks rb_write to know where data ends; seq is informational.
+            let new_write = (actual_write + frame_len) % cap;
+            let header_mut = unsafe { &mut *(self.base_ptr() as *mut ShmHeader) };
+            header_mut.rb_write = new_write;
+
+            // Memory fence: ensure write cursor is visible before incrementing seq
+            std::sync::atomic::fence(Ordering::Release);
+
+            if instance_id == 0 {
+                header_mut.seq_a += 1;
+            } else {
+                header_mut.seq_b += 1;
+            }
+
+            Self::release_lock(lock);
+
+            trace!(
+                "Pushed event ({} bytes) at offset {}, next write={}",
+                data_len,
+                actual_write,
+                new_write
             );
-            std::ptr::copy_nonoverlapping(
-                encoded.as_ptr(),
-                rb.add(actual_write as usize + 4),
-                data_len as usize,
-            );
+            return Ok(());
         }
-
-        // Update header: write cursor and sequence
-        let header_mut = unsafe { &mut *(self.base_ptr() as *mut ShmHeader) };
-        header_mut.rb_write = (actual_write + frame_len) % cap;
-
-        if instance_id == 0 {
-            header_mut.seq_a += 1;
-        } else {
-            header_mut.seq_b += 1;
-        }
-
-        Self::release_lock(lock);
-
-        trace!(
-            "Pushed event ({} bytes) at offset {}, next write={}",
-            data_len,
-            actual_write,
-            header_mut.rb_write
-        );
-        Ok(())
     }
 
     /// Pop all pending events from the ring buffer for the given reader instance.
+    ///
+    /// Acquires the lock to prevent reading partially-written frames.
     pub fn pop_events(&self, instance_id: u64) -> Result<Vec<EventEnvelope>> {
+        let lock = self
+            .try_acquire_lock(instance_id)
+            .ok_or_else(|| anyhow::anyhow!("Failed to acquire lock for pop"))?;
+
         let header = unsafe { self.read_header() };
         let cap = header.rb_capacity;
 
@@ -244,6 +295,7 @@ impl ShmTransport {
         let write_offset = header.rb_write;
 
         if read_offset == write_offset {
+            Self::release_lock(lock);
             return Ok(Vec::new());
         }
 
@@ -251,11 +303,7 @@ impl ShmTransport {
         let rb = self.rb_ptr();
         let mut cursor = read_offset;
 
-        loop {
-            if cursor == write_offset {
-                break;
-            }
-
+        while cursor != write_offset {
             // Read length prefix
             let mut len_buf = [0u8; 4];
             unsafe {
@@ -273,33 +321,30 @@ impl ShmTransport {
                 // Re-read length at offset 0
                 unsafe {
                     std::ptr::copy_nonoverlapping(
-                        rb.add(cursor as usize),
+                        rb.add(0),
                         len_buf.as_mut_ptr(),
                         4,
                     );
                 }
                 let len2 = u32::from_le_bytes(len_buf);
                 if len2 == WRAP_SENTINEL {
-                    break; // Should not happen
+                    break;
                 }
-                // Fall through to read the frame at offset 0 with len2
+                // Read frame at offset 0
                 let data_len = len2 as usize;
-                if cursor + 4 + data_len as u32 > cap {
+                if 4 + data_len as u32 > cap {
                     break;
                 }
                 let mut data = vec![0u8; data_len];
                 unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        rb.add(cursor as usize + 4),
-                        data.as_mut_ptr(),
-                        data_len,
-                    );
+                    std::ptr::copy_nonoverlapping(rb.add(4), data.as_mut_ptr(), data_len);
                 }
-                match bincode::deserialize::<EventEnvelope>(&data) {
-                    Ok(env) => events.push(env),
-                    Err(e) => tracing::warn!("Failed to deserialize event: {}", e),
+                if let Ok(env) = bincode::deserialize::<EventEnvelope>(&data) {
+                    events.push(env);
+                } else {
+                    tracing::warn!("Failed to deserialize event after sentinel");
                 }
-                cursor = (cursor + 4 + data_len as u32) % cap;
+                cursor = (4 + data_len as u32) % cap;
                 continue;
             }
 
@@ -334,13 +379,15 @@ impl ShmTransport {
             cursor = (cursor + 4 + len) % cap;
         }
 
-        // Update read cursor for this instance
+        // Update read cursor
         let header_mut = unsafe { &mut *(self.base_ptr() as *mut ShmHeader) };
         if instance_id == 0 {
             header_mut.rb_read_a = cursor;
         } else {
             header_mut.rb_read_b = cursor;
         }
+
+        Self::release_lock(lock);
 
         debug!("Popped {} events, read cursor now at {}", events.len(), cursor);
         Ok(events)
@@ -357,7 +404,6 @@ impl ShmTransport {
 impl Drop for ShmTransport {
     fn drop(&mut self) {
         debug!("Dropping SHM '{}'", self.shm_name);
-        // shared_memory crate handles cleanup
     }
 }
 
@@ -368,7 +414,6 @@ mod tests {
     use std::path::PathBuf;
 
     fn unique_name(suffix: &str) -> String {
-        // Use a temp directory for the flink path to avoid invalid chars on Windows
         let mut path = std::env::temp_dir();
         path.push(format!("dirsync_test_{}_{}", std::process::id(), suffix));
         path.to_string_lossy().into_owned()
@@ -461,18 +506,15 @@ mod tests {
         let first = shm.pop_events(1).unwrap();
         assert_eq!(first.len(), 2);
 
-        // Second pop should return empty (cursor advanced)
         let second = shm.pop_events(1).unwrap();
         assert!(second.is_empty());
     }
 
     #[test]
     fn test_ring_buffer_wrap_around() {
-        // Use a small buffer to force wrap-around quickly
         let name = unique_name("wrap_around");
         let shm = ShmTransport::create(&name, 4096).unwrap();
 
-        // Fill and drain the buffer multiple times to exercise wrap
         for round in 0..20 {
             let envelope = make_envelope(round, &format!("round_{round}.txt"));
             shm.push_event(0, &envelope).unwrap();
@@ -489,15 +531,12 @@ mod tests {
 
         shm.push_event(0, &make_envelope(1, "shared.txt")).unwrap();
 
-        // Instance 0 reads
         let ev0 = shm.pop_events(0).unwrap();
         assert_eq!(ev0.len(), 1);
 
-        // Instance 1 still sees the event
         let ev1 = shm.pop_events(1).unwrap();
         assert_eq!(ev1.len(), 1);
 
-        // Both now empty
         assert!(shm.pop_events(0).unwrap().is_empty());
         assert!(shm.pop_events(1).unwrap().is_empty());
     }
@@ -505,30 +544,20 @@ mod tests {
     #[test]
     fn test_overflow_returns_error() {
         let name = unique_name("overflow");
-        // Small buffer: header(56) + ~900 bytes ring buffer
         let shm = ShmTransport::create(&name, 1024).unwrap();
 
-        // Push events until the buffer fills up
-        let mut pushed = 0;
-        for i in 0..100 {
-            let event = EventEnvelope {
-                instance_id: 0,
-                seq: i,
-                timestamp: 1700000000000 + i as i64,
-                event: SyncEvent::FileCreated {
-                    path: PathBuf::from(format!("file_{i}.txt")),
-                    content_hash: [0u8; 32],
-                    size: 100,
-                },
-            };
-            match shm.push_event(0, &event) {
-                Ok(()) => pushed += 1,
-                Err(_) => break,
-            }
-        }
-        // Should have pushed some but not all 100
-        assert!(pushed > 0, "Expected at least one push to succeed");
-        assert!(pushed < 100, "Expected overflow before 100 events");
+        let event = EventEnvelope {
+            instance_id: 0,
+            seq: 1,
+            timestamp: 1700000000000,
+            event: SyncEvent::FileContent {
+                path: PathBuf::from("too_large.bin"),
+                offset: 0,
+                data: vec![0u8; 2048],
+            },
+        };
+
+        assert!(shm.push_event(0, &event).is_err());
     }
 
     #[test]

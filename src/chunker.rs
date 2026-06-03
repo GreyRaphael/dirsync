@@ -1,22 +1,19 @@
 use crate::event::SyncEvent;
-use anyhow::{Context, Result};
-use std::fs;
 use std::path::Path;
 use tracing::debug;
 
 /// Default chunk size for file content transfer (64KB).
 pub const DEFAULT_CHUNK_SIZE: usize = 64 * 1024;
 
-/// Read a file and produce a sequence of `SyncEvent::FileContent` events
-/// that carry the file data in chunks small enough for the ring buffer.
-pub fn chunk_file(
+/// Produce a sequence of `SyncEvent::FileContent` events from pre-read file data.
+///
+/// This is the preferred entry point — the caller reads the file once and passes
+/// the data here, eliminating the TOCTOU between hashing and chunking.
+pub fn chunk_data(
     relative_path: &Path,
-    absolute_path: &Path,
+    data: &[u8],
     chunk_size: usize,
-) -> Result<Vec<SyncEvent>> {
-    let data = fs::read(absolute_path)
-        .with_context(|| format!("Failed to read file for chunking: {}", absolute_path.display()))?;
-
+) -> Vec<SyncEvent> {
     let total_size = data.len();
     let mut events = Vec::new();
     let mut offset: u64 = 0;
@@ -31,7 +28,6 @@ pub fn chunk_file(
     }
 
     if events.is_empty() {
-        // Empty file — send a single zero-length chunk
         events.push(SyncEvent::FileContent {
             path: relative_path.to_path_buf(),
             offset: 0,
@@ -47,31 +43,17 @@ pub fn chunk_file(
         chunk_size
     );
 
-    Ok(events)
-}
-
-/// Estimate the serialized size of a FileContent event to decide
-/// whether chunking is needed.
-#[allow(dead_code)]
-pub fn estimated_event_size(data_len: usize) -> usize {
-    // bincode overhead: enum variant (1) + path prefix + hash(32) + offset(8) + data len prefix
-    // Rough estimate: ~100 bytes overhead + data
-    100 + data_len
+    events
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
     use std::path::PathBuf;
-    use tempfile::NamedTempFile;
 
     #[test]
-    fn test_chunk_small_file() {
-        let mut f = NamedTempFile::new().unwrap();
-        f.write_all(b"hello world").unwrap();
-
-        let events = chunk_file(Path::new("test.txt"), f.path(), DEFAULT_CHUNK_SIZE).unwrap();
+    fn test_chunk_small_data() {
+        let events = chunk_data(Path::new("test.txt"), b"hello world", DEFAULT_CHUNK_SIZE);
         assert_eq!(events.len(), 1);
         match &events[0] {
             SyncEvent::FileContent { path, offset, data } => {
@@ -84,16 +66,11 @@ mod tests {
     }
 
     #[test]
-    fn test_chunk_large_file() {
-        let mut f = NamedTempFile::new().unwrap();
+    fn test_chunk_large_data() {
         let data = vec![0xABu8; 200];
-        f.write_all(&data).unwrap();
-
-        // Chunk size 64 → 200/64 = 4 chunks
-        let events = chunk_file(Path::new("big.bin"), f.path(), 64).unwrap();
+        let events = chunk_data(Path::new("big.bin"), &data, 64);
         assert_eq!(events.len(), 4);
 
-        // Verify offsets and lengths
         assert_eq!(events[0].offset(), 0);
         assert_eq!(events[0].data_len(), 64);
         assert_eq!(events[1].offset(), 64);
@@ -105,9 +82,8 @@ mod tests {
     }
 
     #[test]
-    fn test_chunk_empty_file() {
-        let f = NamedTempFile::new().unwrap();
-        let events = chunk_file(Path::new("empty.txt"), f.path(), DEFAULT_CHUNK_SIZE).unwrap();
+    fn test_chunk_empty_data() {
+        let events = chunk_data(Path::new("empty.txt"), b"", DEFAULT_CHUNK_SIZE);
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].data_len(), 0);
     }
