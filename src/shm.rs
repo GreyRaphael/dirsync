@@ -80,8 +80,7 @@ impl ShmTransport {
 
         let shmem = ShmemConf::new()
             .size(total_size)
-            .flink(name)
-            .force_create_flink()
+            .os_id(name)
             .create()
             .context("Failed to create shared memory")?;
 
@@ -104,7 +103,7 @@ impl ShmTransport {
 
     pub fn open(name: &str) -> Result<Self> {
         let shmem = ShmemConf::new()
-            .flink(name)
+            .os_id(name)
             .open()
             .context("Failed to open shared memory")?;
 
@@ -560,9 +559,7 @@ mod tests {
     use std::path::PathBuf;
 
     fn unique_name(suffix: &str) -> String {
-        let mut path = std::env::temp_dir();
-        path.push(format!("dirsync_test_{}_{}", std::process::id(), suffix));
-        path.to_string_lossy().into_owned()
+        format!("/dirsync_test_{}_{}", std::process::id(), suffix)
     }
 
     fn make_envelope(seq: u64, path: &str) -> EventEnvelope {

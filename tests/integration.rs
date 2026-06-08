@@ -16,9 +16,7 @@ fn unique_shm_name(suffix: &str) -> String {
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    let mut path = std::env::temp_dir();
-    path.push(format!("dirsync_itest_{}_{}", ts, suffix));
-    path.to_string_lossy().into_owned()
+    format!("/dirsync_itest_{}_{}", ts, suffix)
 }
 
 fn hash_size(data: &[u8]) -> ([u8; 32], u64) {

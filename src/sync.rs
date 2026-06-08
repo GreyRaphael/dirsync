@@ -367,7 +367,7 @@ mod tests {
         let cli = Cli {
             command: Command::Host(RunArgs {
                 input: dir.to_path_buf(),
-                shm_name: format!("dirsync_sync_test_{}", std::process::id()),
+                shm_name: format!("/dirsync_sync_test_{}", std::process::id()),
                 shm_size: 65536,
                 verbose: 0,
                 conflict: ConflictStrategy::LastWriteWins,
@@ -419,7 +419,7 @@ mod tests {
         let cli = Cli {
             command: Command::Host(RunArgs {
                 input: dir.path().to_path_buf(),
-                shm_name: format!("dirsync_shutdown_test_{}", std::process::id()),
+                shm_name: format!("/dirsync_shutdown_test_{}", std::process::id()),
                 shm_size: 65536,
                 verbose: 0,
                 conflict: ConflictStrategy::LastWriteWins,
