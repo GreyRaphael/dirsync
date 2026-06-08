@@ -14,6 +14,9 @@ struct PendingFileTransfer {
     expected_hash: [u8; 32],
     expected_size: u64,
     temp_path: PathBuf,
+    /// Cached file handle — kept open across chunks to avoid per-chunk
+    /// open/close syscalls that dominate transfer time for large files.
+    file: std::fs::File,
 }
 
 pub struct ChangeApplier {
@@ -253,7 +256,11 @@ impl ChangeApplier {
                 format!("Failed to create temp parent dir: {}", parent.display())
             })?;
         }
-        fs::File::create(&temp_path)
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&temp_path)
             .with_context(|| format!("Failed to create temp file: {}", temp_path.display()))?;
 
         self.pending_remote_files.insert(
@@ -262,30 +269,23 @@ impl ChangeApplier {
                 expected_hash,
                 expected_size,
                 temp_path,
+                file,
             },
         );
         Ok(())
     }
 
     fn write_pending_chunk(&mut self, path: &Path, offset: u64, data: &[u8]) -> Result<()> {
-        let pending = match self.pending_remote_files.get(path) {
+        let pending = match self.pending_remote_files.get_mut(path) {
             Some(p) => p,
             None => return self.write_direct_chunk(path, offset, data),
         };
 
         use std::io::{Seek, SeekFrom, Write};
-        let mut file = fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(false)
-            .open(&pending.temp_path)
-            .with_context(|| {
-                format!("Failed to open temp file: {}", pending.temp_path.display())
-            })?;
-        file.seek(SeekFrom::Start(offset)).with_context(|| {
+        pending.file.seek(SeekFrom::Start(offset)).with_context(|| {
             format!("Failed to seek temp file: {}", pending.temp_path.display())
         })?;
-        file.write_all(data).with_context(|| {
+        pending.file.write_all(data).with_context(|| {
             format!(
                 "Failed to write temp content: {}",
                 pending.temp_path.display()
@@ -307,6 +307,18 @@ impl ChangeApplier {
         if current_size < expected_size {
             return Ok(());
         }
+
+        // File is complete — flush the cached handle so all buffered
+        // writes hit disk before we hash.
+        {
+            use std::io::Write;
+            if let Some(pending) = self.pending_remote_files.get_mut(path) {
+                pending.file.flush().with_context(|| {
+                    format!("Failed to flush temp file: {}", pending.temp_path.display())
+                })?;
+            }
+        }
+
         if current_size > expected_size {
             warn!(
                 "Received too much data for {} (expected={}B, temp={}B)",
@@ -335,6 +347,11 @@ impl ChangeApplier {
             fs::create_dir_all(parent)
                 .with_context(|| format!("Failed to create parent dir: {}", parent.display()))?;
         }
+        // Drop the cached file handle before renaming — Windows requires
+        // the handle to be closed.
+        if let Some(pending) = self.pending_remote_files.remove(path) {
+            drop(pending.file);
+        }
         if full_path.exists() {
             fs::remove_file(&full_path).with_context(|| {
                 format!("Failed to replace existing file: {}", full_path.display())
@@ -348,7 +365,6 @@ impl ChangeApplier {
             )
         })?;
 
-        self.pending_remote_files.remove(path);
         self.last_synced_hash
             .insert(path.to_path_buf(), (expected_hash, expected_size));
         info!(

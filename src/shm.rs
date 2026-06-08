@@ -349,107 +349,121 @@ impl ShmTransport {
     }
 
     pub fn push_event(&self, instance_id: u64, envelope: &EventEnvelope) -> Result<()> {
-        let encoded = bincode::serialize(envelope).context("Failed to serialize event")?;
-        let data_len = encoded.len() as u32;
-        let frame_len = 4 + data_len;
-        let deadline = Instant::now() + PUSH_WAIT_TIMEOUT;
+        // Reuse a thread-local buffer to avoid allocating a new Vec for
+        // every event.  For a 4 MB chunk this saves ~4 MB of allocator
+        // pressure per call.
+        thread_local! {
+            static SERIALIZE_BUF: std::cell::RefCell<Vec<u8>> =
+                std::cell::RefCell::new(Vec::with_capacity(1024));
+        }
 
-        loop {
-            let lock = self
-                .try_acquire_lock(instance_id)
-                .ok_or_else(|| anyhow::anyhow!("Failed to acquire lock"))?;
+        SERIALIZE_BUF.with(|buf| {
+            let mut buf = buf.borrow_mut();
+            buf.clear();
+            bincode::serialize_into(&mut *buf, envelope)
+                .context("Failed to serialize event")?;
 
-            let header = unsafe { self.read_header() };
-            let cap = header.rb_capacity;
-            let w = header.rb_write;
+            let data_len = buf.len() as u32;
+            let frame_len = 4 + data_len;
+            let deadline = Instant::now() + PUSH_WAIT_TIMEOUT;
 
-            if frame_len > cap.saturating_sub(4) {
-                Self::release_lock(lock);
-                anyhow::bail!(
-                    "Event too large ({} bytes) for buffer ({} bytes)",
-                    frame_len,
-                    cap
-                );
-            }
+            loop {
+                let lock = self
+                    .try_acquire_lock(instance_id)
+                    .ok_or_else(|| anyhow::anyhow!("Failed to acquire lock"))?;
 
-            let tail_remaining = cap - w;
-            let would_leave_tiny_tail = w + frame_len < cap && cap - (w + frame_len) < 4;
-            let needs_wrap = w + frame_len > cap || would_leave_tiny_tail;
-            let required = if needs_wrap {
-                tail_remaining + frame_len
-            } else {
-                frame_len
-            };
-            let free = self.free_bytes_locked();
+                let header = unsafe { self.read_header() };
+                let cap = header.rb_capacity;
+                let w = header.rb_write;
 
-            if required > free {
-                Self::release_lock(lock);
-                if Instant::now() >= deadline {
+                if frame_len > cap.saturating_sub(4) {
+                    Self::release_lock(lock);
                     anyhow::bail!(
-                        "Ring buffer full for {}ms: need {} bytes, {} free",
-                        PUSH_WAIT_TIMEOUT.as_millis(),
-                        required,
-                        free
+                        "Event too large ({} bytes) for buffer ({} bytes)",
+                        frame_len,
+                        cap
                     );
                 }
-                std::thread::sleep(PUSH_RETRY_SLEEP);
-                continue;
-            }
 
-            let rb = self.rb_ptr();
-            let actual_write = if needs_wrap {
-                if w != 0 {
-                    if tail_remaining < 4 {
-                        Self::release_lock(lock);
+                let tail_remaining = cap - w;
+                let would_leave_tiny_tail = w + frame_len < cap && cap - (w + frame_len) < 4;
+                let needs_wrap = w + frame_len > cap || would_leave_tiny_tail;
+                let required = if needs_wrap {
+                    tail_remaining + frame_len
+                } else {
+                    frame_len
+                };
+                let free = self.free_bytes_locked();
+
+                if required > free {
+                    Self::release_lock(lock);
+                    if Instant::now() >= deadline {
                         anyhow::bail!(
-                            "Ring buffer tail too small for wrap sentinel (w={}, cap={})",
-                            w,
-                            cap
+                            "Ring buffer full for {}ms: need {} bytes, {} free",
+                            PUSH_WAIT_TIMEOUT.as_millis(),
+                            required,
+                            free
                         );
                     }
-                    let sentinel = WRAP_SENTINEL.to_le_bytes();
-                    unsafe {
-                        std::ptr::copy_nonoverlapping(sentinel.as_ptr(), rb.add(w as usize), 4);
-                    }
+                    std::thread::sleep(PUSH_RETRY_SLEEP);
+                    continue;
                 }
-                0u32
-            } else {
-                w
-            };
 
-            unsafe {
-                std::ptr::copy_nonoverlapping(
-                    data_len.to_le_bytes().as_ptr(),
-                    rb.add(actual_write as usize),
-                    4,
+                let rb = self.rb_ptr();
+                let actual_write = if needs_wrap {
+                    if w != 0 {
+                        if tail_remaining < 4 {
+                            Self::release_lock(lock);
+                            anyhow::bail!(
+                                "Ring buffer tail too small for wrap sentinel (w={}, cap={})",
+                                w,
+                                cap
+                            );
+                        }
+                        let sentinel = WRAP_SENTINEL.to_le_bytes();
+                        unsafe {
+                            std::ptr::copy_nonoverlapping(sentinel.as_ptr(), rb.add(w as usize), 4);
+                        }
+                    }
+                    0u32
+                } else {
+                    w
+                };
+
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        data_len.to_le_bytes().as_ptr(),
+                        rb.add(actual_write as usize),
+                        4,
+                    );
+                    std::ptr::copy_nonoverlapping(
+                        buf.as_ptr(),
+                        rb.add(actual_write as usize + 4),
+                        data_len as usize,
+                    );
+                }
+
+                let new_write = (actual_write + frame_len) % cap;
+                let header_mut = unsafe { &mut *(self.base_ptr() as *mut ShmHeader) };
+                header_mut.rb_write = new_write;
+
+                std::sync::atomic::fence(Ordering::Release);
+
+                if instance_id == 0 {
+                    header_mut.seq_a += 1;
+                } else {
+                    header_mut.seq_b += 1;
+                }
+
+                Self::release_lock(lock);
+
+                trace!(
+                    "Pushed event ({} bytes) at offset {}, next write={}",
+                    data_len, actual_write, new_write
                 );
-                std::ptr::copy_nonoverlapping(
-                    encoded.as_ptr(),
-                    rb.add(actual_write as usize + 4),
-                    data_len as usize,
-                );
+                return Ok(());
             }
-
-            let new_write = (actual_write + frame_len) % cap;
-            let header_mut = unsafe { &mut *(self.base_ptr() as *mut ShmHeader) };
-            header_mut.rb_write = new_write;
-
-            std::sync::atomic::fence(Ordering::Release);
-
-            if instance_id == 0 {
-                header_mut.seq_a += 1;
-            } else {
-                header_mut.seq_b += 1;
-            }
-
-            Self::release_lock(lock);
-
-            trace!(
-                "Pushed event ({} bytes) at offset {}, next write={}",
-                data_len, actual_write, new_write
-            );
-            return Ok(());
-        }
+        })
     }
 
     pub fn pop_events(&self, instance_id: u64) -> Result<Vec<EventEnvelope>> {
