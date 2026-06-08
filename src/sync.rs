@@ -6,6 +6,7 @@ use crate::shm::ShmTransport;
 use crate::watcher::{self, FsWatcher};
 use anyhow::Result;
 use std::collections::HashSet;
+use std::io::Read;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -18,6 +19,11 @@ const STABILITY_INTERVAL: Duration = Duration::from_millis(200);
 const STABILITY_MAX_WAIT: Duration = Duration::from_secs(30);
 const REMOTE_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const MIN_CHUNK_SIZE: usize = 16 * 1024;
+
+/// Drain remote events at most once every N chunks during bulk transfer.
+/// This avoids the per-chunk spinlock + deserialization + filesystem-write
+/// overhead that dominates transfer time for large files.
+const DRAIN_EVERY_N_CHUNKS: u64 = 8;
 
 pub struct SyncEngine {
     instance_id: u64,
@@ -148,7 +154,13 @@ impl SyncEngine {
             }
         }
 
-        // First pass: compute hash and size by streaming (constant memory).
+        // ── Hash first, then stream content with batched drain ────────
+        // Hash pass reads the full file (sequential, ~60 MB for a large
+        // file).  The chunk pass re-reads from OS page cache so it's
+        // essentially free.  The real speed-up comes from batched drain:
+        // we only call `drain_remote_events` every N chunks instead of
+        // after every single chunk, amortising the spinlock +
+        // deserialization + filesystem-apply overhead.
         let (hash, size) = match watcher::file_hash_and_size(&abs_path) {
             Ok(v) => v,
             Err(e) => {
@@ -174,8 +186,7 @@ impl SyncEngine {
         self.push_and_maybe_drain(corrected_event.clone(), drain_remote)?;
         self.watcher.record_applied_event(&corrected_event);
 
-        // Second pass: stream file content in chunks (constant memory).
-        use std::io::Read;
+        // Stream content chunks with batched drain.
         let mut file = match std::fs::File::open(&abs_path) {
             Ok(f) => f,
             Err(e) => {
@@ -185,6 +196,8 @@ impl SyncEngine {
         };
         let mut buf = vec![0u8; self.chunk_size];
         let mut offset: u64 = 0;
+        let mut chunks_pushed: u64 = 0;
+
         loop {
             let n = match file.read(&mut buf) {
                 Ok(0) => break,
@@ -194,16 +207,33 @@ impl SyncEngine {
                     break;
                 }
             };
-            self.push_and_maybe_drain(
-                SyncEvent::FileContent {
-                    path: rel_path.clone(),
-                    offset,
-                    data: buf[..n].to_vec(),
-                },
-                drain_remote,
-            )?;
+
+            self.push(SyncEvent::FileContent {
+                path: rel_path.clone(),
+                offset,
+                data: buf[..n].to_vec(),
+            })?;
+            chunks_pushed += 1;
             offset += n as u64;
+
+            // Batched drain: only drain every N chunks to amortise the
+            // spinlock + deserialization + apply overhead.
+            if drain_remote && chunks_pushed.is_multiple_of(DRAIN_EVERY_N_CHUNKS) {
+                self.drain_remote_events()?;
+            }
         }
+
+        // Final drain to pick up anything we deferred.
+        if drain_remote {
+            self.drain_remote_events()?;
+        }
+
+        debug!(
+            "Streamed {} ({} bytes, {} chunks)",
+            rel_path.display(),
+            size,
+            chunks_pushed
+        );
 
         Ok(())
     }
