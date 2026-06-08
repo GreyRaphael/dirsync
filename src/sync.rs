@@ -429,13 +429,21 @@ impl SyncEngine {
 mod tests {
     use super::*;
     use crate::cli::{Command, ConflictStrategy, RunArgs};
+    use std::sync::atomic::AtomicU64;
     use tempfile::TempDir;
+
+    static SHM_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    fn unique_shm_name() -> String {
+        let n = SHM_COUNTER.fetch_add(1, Ordering::Relaxed);
+        format!("/dirsync_sync_test_{}_{}", std::process::id(), n)
+    }
 
     fn make_engine(dir: &std::path::Path) -> SyncEngine {
         let cli = Cli {
             command: Command::Host(RunArgs {
                 input: dir.to_path_buf(),
-                shm_name: format!("/dirsync_sync_test_{}", std::process::id()),
+                shm_name: unique_shm_name(),
                 shm_size: 65536,
                 verbose: 0,
                 conflict: ConflictStrategy::LastWriteWins,
@@ -487,7 +495,7 @@ mod tests {
         let cli = Cli {
             command: Command::Host(RunArgs {
                 input: dir.path().to_path_buf(),
-                shm_name: format!("/dirsync_shutdown_test_{}", std::process::id()),
+                shm_name: unique_shm_name(),
                 shm_size: 65536,
                 verbose: 0,
                 conflict: ConflictStrategy::LastWriteWins,
