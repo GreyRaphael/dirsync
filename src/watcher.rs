@@ -500,11 +500,26 @@ fn streaming_hash_inner(path: &Path) -> Result<([u8; 32], u64)> {
 pub fn wait_for_stable(path: &Path, interval: Duration, max_wait: Duration) -> Result<u64> {
     let initial =
         fs::metadata(path).with_context(|| format!("Failed to stat {}", path.display()))?;
-    let mut prev_size = initial.len();
-    let mut prev_modified = initial.modified().ok();
+    let prev_size = initial.len();
+    let prev_modified = initial.modified().ok();
+    let required_quiet = std::cmp::max(interval.saturating_mul(10), Duration::from_secs(2));
+
+    // Fast path: if the file's mtime is already older than `required_quiet`,
+    // it has been stable long enough — no need to poll at all.  This covers
+    // files that finished writing before the watcher event fired (the common
+    // case for small/medium files).
+    if let Some(mtime) = prev_modified
+        && let Ok(elapsed_since_write) = mtime.elapsed()
+        && elapsed_since_write >= required_quiet
+    {
+        return Ok(prev_size);
+    }
+
+    // Slow path: poll until the file stops changing for `required_quiet`.
+    let mut prev_size = prev_size;
+    let mut prev_modified = prev_modified;
     let mut quiet_for = Duration::ZERO;
     let mut elapsed = Duration::ZERO;
-    let required_quiet = std::cmp::max(interval.saturating_mul(10), Duration::from_secs(2));
 
     loop {
         std::thread::sleep(interval);
