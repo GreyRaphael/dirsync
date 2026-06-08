@@ -1,6 +1,6 @@
 [package]
 name = "dirsync"
-version = "1.0.0"
+version = "1.0.4"
 edition = "2024"
 description = "Directory synchronization over shared memory"
 

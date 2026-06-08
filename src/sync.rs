@@ -42,7 +42,19 @@ impl SyncEngine {
             .canonicalize()
             .unwrap_or_else(|_| cli.input().clone());
 
-        let mut shm = ShmTransport::create_or_open(cli.shm_name(), cli.shm_size())?;
+        // Role-aware SHM initialization:
+        // - Host (instance 0): create or open — the host owns the SHM lifecycle.
+        // - Join (instance 1): only open — retries until the host's segment appears.
+        //
+        // This is critical for sandboxed environments (e.g. Windows Sandbox)
+        // where the sandbox can see host-created kernel objects but NOT vice
+        // versa.  If the join side created its own segment, the host would
+        // never see it.
+        let mut shm = if instance_id == 0 {
+            ShmTransport::create_or_open(cli.shm_name(), cli.shm_size())?
+        } else {
+            Self::open_shm_with_retry(cli.shm_name(), &running)?
+        };
         shm.register_instance(instance_id)?;
 
         let chunk_size =
@@ -194,6 +206,32 @@ impl SyncEngine {
         }
 
         Ok(())
+    }
+
+    /// Open an existing SHM segment, retrying until it appears or shutdown is
+    /// requested.  Used by the join side which must never create its own
+    /// segment (see comment in [`new`]).
+    fn open_shm_with_retry(
+        name: &str,
+        running: &Arc<AtomicBool>,
+    ) -> Result<ShmTransport> {
+        let mut last_log = Instant::now() - Duration::from_secs(5);
+        while running.load(Ordering::Relaxed) {
+            match ShmTransport::open(name) {
+                Ok(shm) => return Ok(shm),
+                Err(_) => {
+                    if last_log.elapsed() >= Duration::from_secs(5) {
+                        info!(
+                            "Waiting for host to create SHM '{}'...",
+                            name
+                        );
+                        last_log = Instant::now();
+                    }
+                    std::thread::sleep(Duration::from_millis(200));
+                }
+            }
+        }
+        anyhow::bail!("Shutdown requested before SHM segment appeared")
     }
 
     pub fn wait_for_peer(&self) -> Result<()> {

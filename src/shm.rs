@@ -9,6 +9,26 @@ const WRAP_SENTINEL: u32 = 0xFFFFFFFF;
 
 const MAX_SPIN: u32 = 2_000_000;
 
+/// Normalize a user-supplied SHM name for the current platform.
+///
+/// - **Linux/macOS** (POSIX `shm_open`): name must start with `/`.
+/// - **Windows** (`CreateFileMappingW`): name must NOT start with `/` —
+///   the literal `/` becomes part of the name and creates a *different* object.
+fn normalize_os_id(name: &str) -> String {
+    if cfg!(target_os = "windows") {
+        // Strip leading '/' — on Windows it's not a namespace separator,
+        // it becomes part of the object name.
+        name.strip_prefix('/').unwrap_or(name).to_string()
+    } else {
+        // POSIX requires names to start with '/'
+        if name.starts_with('/') {
+            name.to_string()
+        } else {
+            format!("/{}", name)
+        }
+    }
+}
+
 const PUSH_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
 const PUSH_RETRY_SLEEP: Duration = Duration::from_millis(10);
 
@@ -78,9 +98,10 @@ impl ShmTransport {
     pub fn create(name: &str, total_size: usize) -> Result<Self> {
         Self::validate_total_size(total_size)?;
 
+        let normalized = normalize_os_id(name);
         let shmem = ShmemConf::new()
             .size(total_size)
-            .os_id(name)
+            .os_id(&normalized)
             .create()
             .context("Failed to create shared memory")?;
 
@@ -102,8 +123,9 @@ impl ShmTransport {
     }
 
     pub fn open(name: &str) -> Result<Self> {
+        let normalized = normalize_os_id(name);
         let shmem = ShmemConf::new()
-            .os_id(name)
+            .os_id(&normalized)
             .open()
             .context("Failed to open shared memory")?;
 

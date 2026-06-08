@@ -31,7 +31,7 @@ pub struct RunArgs {
     pub input: PathBuf,
 
     /// Shared memory segment name (must be the same for both instances)
-    #[arg(long, default_value = "/dirsync_shm")]
+    #[arg(long, default_value = "dirsync_shm_v3")]
     pub shm_name: String,
 
     /// Shared memory size in bytes (default: 64MB)
